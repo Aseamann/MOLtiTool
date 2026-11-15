@@ -38,6 +38,54 @@ _HIDDEN = {'script_hub.py', 'print3d_core.py'}
 
 _state = {'dock': None, 'loaded': set()}
 
+HELP = {
+    'thickness': (
+        'Sets how thick the cartoon and sticks are, in Angstrom (full width and thickness, '
+        'the same meaning as ChimeraX). Applies to every object. Once scaled, parts thinner '
+        'than about 1.5 mm break easily on an FDM printer; the export report warns about '
+        'them. Smoothness is PyMOL\'s cartoon_sampling (higher is smoother, files get bigger).'),
+    'separate': (
+        'Copies ligands or chains into their own objects, so each is surfaced on its own '
+        '(the protein never cuts into a glycan surface) and can be exported as its own file.\n'
+        'Each ligand: polymer plus one object per connected ligand. All ligands together: '
+        'polymer plus one ligand object. Chains: one object per chain. Objects as they are: '
+        'no copying. The original object is hidden, and struts made earlier follow the parts. '
+        'Tick "One file per object" when exporting.'),
+    'struts': (
+        'Struts are rods that brace the model so it survives printing. They join atoms that '
+        'are close in space (Max length, A) but far apart along the chain (Min loop, A). '
+        'Leave Color blank and each strut takes the color of its chain (half and half if it '
+        'joins two chains); type a color to use one color for all. "Add struts" replaces the '
+        'previous set in that object.\n'
+        'Single struts: type two atoms or residues (a residue uses its CA), or select two in '
+        'the viewer and press "From sele". "Add strut" adds one, "Remove strut" removes the '
+        'one between them; leave Atom 2 blank to remove every strut at Atom 1.'),
+    'snapfit': (
+        'For parts printed separately, such as a glycan that should click onto its protein. '
+        'The guest gets a seat cut to the host\'s shape, plus a peg (the host gets a walled '
+        'socket) or pockets for small magnets in both. Sizes are in mm after scaling. '
+        'Clearance on "auto" is half the nozzle size (0.2 mm for a 0.4 mm nozzle). Applied '
+        'when exporting with "One file per object"; needs the merge library.'),
+    'export': (
+        '3MF opens ready to slice in OrcaSlicer, Anycubic Slicer Next and Bambu Studio, with '
+        'each part on its filament slot. OBJ keeps vertex colors; STL writes one file per '
+        'filament.\n'
+        'Nozzle and layer height tune the print: values left on "auto" (thinnest feature, '
+        'fit and socket clearances, pillar thickness, rod smoothness) follow from them, and '
+        'base sizes are rounded to whole layers. "Preview in PyMOL" shows the result over '
+        'the molecule without writing files.\n'
+        'Longest side sets the printed size (or use the scale). "As on screen" prints the '
+        'model the way you see it, screen-down on the bed. Filament colors: every color snaps '
+        'to the closest loaded filament. Single-color printer: one file per color, smaller '
+        'pieces plug into sockets. Base: flat cut, or a stand with pillars. The report lists '
+        'size, grams, thin parts, floating pieces and bed contact.'),
+    'scripts': (
+        'Every .py file in this folder, with the commands it adds. Pick a command, fill in '
+        'the form and press Run; the exact command line appears in the PyMOL log. Scripts '
+        'without commands get a "Run script" button. New files appear after Refresh. To '
+        'write your own, see AGENTS.md in this folder.'),
+}
+
 
 # ---------------------------------------------------------------------------
 # Script discovery (static, no code is executed until you press Load/Run)
@@ -228,9 +276,52 @@ def make_panel(parent=None):
                             else W.QSizePolicy.Fixed)
             return w
 
+        def _help(self, layout, key):
+            """Collapsible 'About' text (hidden until the arrow is clicked)."""
+            box = W.QWidget()
+            vb = W.QVBoxLayout(box)
+            vb.setContentsMargins(0, 0, 0, 4)
+            vb.setSpacing(2)
+            btn = W.QToolButton()
+            btn.setText('About')
+            btn.setCheckable(True)
+            btn.setAutoRaise(True)
+            btn.setToolButtonStyle(_enum(QtCore.Qt, 'ToolButtonTextBesideIcon',
+                                         'ToolButtonStyle.ToolButtonTextBesideIcon'))
+            right = _enum(QtCore.Qt, 'RightArrow', 'ArrowType.RightArrow')
+            down = _enum(QtCore.Qt, 'DownArrow', 'ArrowType.DownArrow')
+            btn.setArrowType(right)
+            lab = W.QLabel(HELP.get(key, ''))
+            lab.setWordWrap(True)
+            lab.setStyleSheet('padding: 2px 4px;')
+            fnt = lab.font()
+            if fnt.pointSizeF() > 0:
+                fnt.setPointSizeF(fnt.pointSizeF() * 0.92)
+            lab.setFont(fnt)
+            lab.setVisible(False)
+
+            def toggled(on):
+                lab.setVisible(on)
+                btn.setArrowType(down if on else right)
+            btn.toggled.connect(toggled)
+            vb.addWidget(btn)
+            vb.addWidget(lab)
+            if isinstance(layout, W.QFormLayout):
+                layout.addRow(box)
+            else:
+                layout.addWidget(box)
+            return box
+
+        @staticmethod
+        def _auto(spin):
+            """0 shows as 'auto' (value derived from nozzle / layer height)."""
+            spin.setSpecialValueText('auto')
+            return spin
+
         @staticmethod
         def _dspin(val, lo=0.0, hi=50.0, step=0.05, dec=2):
             s = W.QDoubleSpinBox()
+            s.setMinimumWidth(96)
             s.setRange(lo, hi)
             s.setSingleStep(step)
             s.setDecimals(dec)
@@ -240,6 +331,7 @@ def make_panel(parent=None):
         @staticmethod
         def _ispin(val, lo=0, hi=1000):
             s = W.QSpinBox()
+            s.setMinimumWidth(96)
             s.setRange(lo, hi)
             s.setValue(val)
             return s
@@ -337,6 +429,7 @@ def make_panel(parent=None):
             # 1. thickness
             g = W.QGroupBox('1. Thickness (Angstrom)')
             f = W.QFormLayout(g)
+            self._help(f, 'thickness')
             R = lambda k, w: self._reg('style', k, w)
             for lab, key, val in (('Helix width', 'helix_width', 3.0),
                                   ('Helix thickness', 'helix_thickness', 1.5),
@@ -357,9 +450,8 @@ def make_panel(parent=None):
 
             # 2. separate parts
             g = W.QGroupBox('2. Separate parts (optional)')
-            g.setToolTip('Copy ligands or chains into their own objects. Each part is '
-                         'surfaced alone and can be exported as its own file.')
             f = W.QFormLayout(g)
+            self._help(f, 'separate')
             R = lambda k, w: self._reg('split', k, w)
             f.addRow('Split by', R('by', self._combo([
                 ('ligands', 'Each ligand'), ('ligands_together', 'All ligands together'),
@@ -381,12 +473,14 @@ def make_panel(parent=None):
             # 3. struts
             g = W.QGroupBox('3. Struts')
             f = W.QFormLayout(g)
+            self._help(f, 'struts')
             R = lambda k, w: self._reg('struts', k, w)
             f.addRow('Atoms', R('selection', W.QLineEdit('name CA')))
             f.addRow('Max length', R('length', self._dspin(8.0, 1, 100, 0.5, 1)))
             f.addRow('Min loop', R('loop', self._dspin(60.0, 1, 500, 5, 0)))
             f.addRow('Radius', R('radius', self._dspin(0.5, 0.05, 5)))
-            crow, scol = self._color_row('grey70')
+            crow, scol = self._color_row('')
+            scol.setPlaceholderText('blank = chain color')
             R('color', scol)
             f.addRow('Color', crow)
             f.addRow('Object name', R('name', W.QLineEdit('struts')))
@@ -399,14 +493,34 @@ def make_panel(parent=None):
             h_.addWidget(b1)
             h_.addWidget(b2)
             f.addRow(h_)
+            single = W.QLabel('Single struts')
+            single.setStyleSheet('font-weight: bold; margin-top: 6px;')
+            f.addRow(single)
+            self.sa1, self.sa2 = W.QLineEdit(), W.QLineEdit()
+            self.sa1.setPlaceholderText('e.g. chain A and resi 45')
+            self.sa2.setPlaceholderText('e.g. chain A and resi 112')
+            f.addRow('Atom 1', self.sa1)
+            f.addRow('Atom 2', self.sa2)
+            h2 = W.QHBoxLayout()
+            bs = W.QPushButton('From sele')
+            bs.setToolTip('Fill Atom 1 and 2 from the two atoms or residues in (sele)')
+            ba, br = W.QPushButton('Add strut'), W.QPushButton('Remove strut')
+            bs.clicked.connect(self._struts_from_sele)
+            ba.clicked.connect(lambda: self._run(
+                'Add strut', print3d.strut_add, self.sa1.text(), self.sa2.text(),
+                self._values('struts')['name'] or 'struts', self._values('struts')['radius'],
+                self._values('struts')['color']))
+            br.clicked.connect(lambda: self._run(
+                'Remove strut', print3d.strut_remove, self.sa1.text(), self.sa2.text(), ''))
+            for b_ in (bs, ba, br):
+                h2.addWidget(b_)
+            f.addRow(h2)
             v.addWidget(g)
 
             # 4. snap-fit
             g = W.QGroupBox('4. Snap-fit (parts printed separately)')
-            g.setToolTip('Joins two exported objects at their contact: the second (guest) '
-                         'gets a seat shaped to the first (host) plus a peg or magnet '
-                         'pockets. Used with "One file per object".')
             f = W.QFormLayout(g)
+            self._help(f, 'snapfit')
             R = lambda k, w: self._reg('snapfit', k, w)
             self.sf_host, self.sf_guest = W.QComboBox(), W.QComboBox()
             for c in (self.sf_host, self.sf_guest):
@@ -425,7 +539,7 @@ def make_panel(parent=None):
             f.addRow('Peg length (mm)', R('length', self._dspin(6.0, 1, 40, 0.5, 1)))
             f.addRow('Magnet diameter (mm)', R('magnet_d', self._dspin(6.0, 1, 30, 0.5, 1)))
             f.addRow('Magnet height (mm)', R('magnet_h', self._dspin(3.0, 0.5, 20, 0.5, 1)))
-            f.addRow('Clearance (mm)', R('clearance', self._dspin(0.2, 0, 2, 0.05, 2)))
+            f.addRow('Clearance (mm)', R('clearance', self._auto(self._dspin(0.0, 0, 2, 0.05, 2))))
             f.addRow('Wall (mm)', R('wall', self._dspin(1.6, 0.4, 10, 0.2, 1)))
             h_ = W.QHBoxLayout()
             b1, b2 = W.QPushButton('Add connector'), W.QPushButton('Clear')
@@ -442,6 +556,7 @@ def make_panel(parent=None):
             # 5. export
             g = W.QGroupBox('5. Export')
             f = W.QFormLayout(g)
+            self._help(f, 'export')
             R = lambda k, w: self._reg('export', k, w)
             orow = W.QWidget()
             oh = W.QHBoxLayout(orow)
@@ -474,6 +589,8 @@ def make_panel(parent=None):
             f.addRow('Format', R('format', self._combo([
                 ('3mf', '3MF: ready to slice'), ('obj', 'OBJ with colors'),
                 ('stl', 'STL per color')])))
+            f.addRow('Nozzle (mm)', R('nozzle', self._dspin(0.4, 0.1, 2.0, 0.05, 2)))
+            f.addRow('Layer height (mm)', R('layer_height', self._dspin(0.2, 0.04, 1.0, 0.02, 2)))
             self.eeach = R('each', W.QCheckBox('One file per object (parts line up)'))
             f.addRow(self.eeach)
             sc = R('single_color', W.QCheckBox('Single-color printer: one file per color'))
@@ -497,7 +614,7 @@ def make_panel(parent=None):
                 ('none', 'None'), ('cut', 'Flat cut bottom'), ('stand', 'Stand with pillars')])))
             f.addRow('Cut depth (mm)', R('base_depth', self._dspin(1.0, 0.1, 20, 0.5, 1)))
             f.addRow('Stand pillars', R('pillars', self._ispin(3, 1, 12)))
-            f.addRow('Pillar thickness (mm)', R('pillar_d', self._dspin(3.0, 1, 20, 0.5, 1)))
+            f.addRow('Pillar thickness (mm)', R('pillar_d', self._auto(self._dspin(0.0, 0, 20, 0.5, 1))))
 
             adv_toggle = W.QCheckBox('Show advanced options')
             adv = W.QWidget()
@@ -510,17 +627,26 @@ def make_panel(parent=None):
                 cb = R(key, W.QCheckBox(lab))
                 cb.setChecked(bool(val))
                 af.addRow(cb)
-            af.addRow('Warn below (mm)', R('min_feature', self._dspin(1.5, 0.2, 10, 0.1, 1)))
+            af.addRow('Thinnest feature (mm)', R('min_feature', self._auto(self._dspin(0.0, 0, 10, 0.1, 2))))
             af.addRow('Join reach (mm)', R('attach_mm', self._dspin(4.0, 0.5, 30, 0.5, 1)))
-            af.addRow('Socket clearance (mm)', R('socket_clearance', self._dspin(0.15, 0, 1, 0.05, 2)))
-            af.addRow('Roundness', R('segments', self._ispin(24, 8, 64)))
+            af.addRow('Socket clearance (mm)', R('socket_clearance', self._auto(self._dspin(0.0, 0, 1, 0.02, 2))))
+            af.addRow('Facets per rod', R('segments', self._auto(self._ispin(0, 0, 64))))
             af.addRow('Color tolerance', R('color_tolerance', self._ispin(0, 0, 128)))
             adv.setVisible(False)
             adv_toggle.toggled.connect(adv.setVisible)
             f.addRow(adv_toggle)
             f.addRow(adv)
-            b = W.QPushButton('Export')
+            hb = W.QHBoxLayout()
+            bp, bc, b = (W.QPushButton('Preview in PyMOL'), W.QPushButton('Clear preview'),
+                         W.QPushButton('Export'))
+            bp.setToolTip('Build the print (base, connectors, rods, colors) and show it in '
+                          'PyMOL over the molecule, without writing files')
+            bp.clicked.connect(lambda: self._export(preview=True))
+            bc.clicked.connect(lambda: (cmd.delete('preview_*'), self._say('Preview removed')))
             b.clicked.connect(self._export)
+            hb.addWidget(bp)
+            hb.addWidget(bc)
+            f.addRow(hb)
             f.addRow(b)
             self.report = W.QPlainTextEdit()
             self.report.setReadOnly(True)
@@ -537,7 +663,8 @@ def make_panel(parent=None):
             v.addWidget(g)
             v.addStretch(1)
             for e in inner.findChildren(W.QLineEdit):
-                self._shrink(e)
+                if not isinstance(e.parent(), (W.QAbstractSpinBox, W.QComboBox)):
+                    self._shrink(e)
             for c in inner.findChildren(W.QComboBox):
                 self._shrink(c)
             self._refresh_objects()
@@ -593,6 +720,27 @@ def make_panel(parent=None):
                 self.preset.setEditText('')
                 self._say('Deleted preset "%s"' % name)
 
+        def _struts_from_sele(self):
+            if 'sele' not in cmd.get_names('selections'):
+                self._say('Select two atoms or residues in the viewer first', error=True)
+                return
+            m = cmd.get_model('sele')
+            if len(m.atom) == 2:
+                specs = ['%s and index %d' % (a.model, a.index) for a in m.atom]
+            else:
+                res = []
+                for a in m.atom:
+                    k = (a.model, a.chain, a.resi)
+                    if k not in res:
+                        res.append(k)
+                if len(res) != 2:
+                    self._say('(sele) has %d residues; select exactly two' % len(res), error=True)
+                    return
+                specs = ['%s and chain "%s" and resi %s' % k for k in res]
+            self.sa1.setText(specs[0])
+            self.sa2.setText(specs[1])
+            self._say('Atom 1 and 2 filled from (sele)')
+
         # --- snap-fit ---
         def _refresh_objects(self):
             names = [n for n in cmd.get_names('objects') if n not in print3d._struts_registry]
@@ -642,18 +790,20 @@ def make_panel(parent=None):
                 self.eeach.setChecked(True)
                 self._refresh_objects()
 
-        def _export(self):
+        def _export(self, preview=False):
             vals = self._values('export')
+            vals['preview'] = int(bool(preview))
             vals['filaments'] = ' '.join(s.text().strip() for s in self.slots if s.text().strip())
             r = self._run('Export', print3d.colorprint, self.efile.text(), **vals)
             self.report.setPlainText('\n'.join(print3d._last.get('report', [])))
             if r:
-                self._say('Exported: %s' % r)
+                self._say(('Preview: %s (Clear preview to remove)' if preview else 'Exported: %s') % r)
 
         # ---------- scripts tab ----------
         def _scripts_tab(self):
             page = W.QWidget()
             v = W.QVBoxLayout(page)
+            self._help(v, 'scripts')
             top = W.QHBoxLayout()
             self.filter = W.QLineEdit()
             self.filter.setPlaceholderText('Filter scripts / commands')

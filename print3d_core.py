@@ -780,7 +780,7 @@ def flat_cut(parts, depth_mm, notes):
     allm = _all_solids(parts)
     if allm is None:
         notes.append('flat cut skipped (needs solid parts)')
-        return parts
+        return parts, 0.0
     zmin = np.asarray(allm.bounding_box())[2]
     zc = zmin + float(depth_mm)
     for p in parts:
@@ -789,9 +789,9 @@ def flat_cut(parts, depth_mm, notes):
     parts = [p for p in parts if p.solid is None or not p.solid.is_empty()]
     _shift(parts, -zc)
     area = _all_solids(parts).slice(0.1).area()
-    notes.append('flat cut %.1f mm off the bottom: %.0f mm2 touches the bed%s'
+    notes.append('flat cut %.2f mm off the bottom: %.0f mm2 touches the bed%s'
                  % (depth_mm, area, ' (small, consider "stand")' if area < 80 else ''))
-    return parts
+    return parts, -zc
 
 
 def pillar_stand(parts, n_pillars=3, pillar_d=3.0, plate_t=2.0, gap=4.0, margin=4.0,
@@ -804,7 +804,7 @@ def pillar_stand(parts, n_pillars=3, pillar_d=3.0, plate_t=2.0, gap=4.0, margin=
     host = _all_solids(host_parts) if host_parts else allm
     if allm is None or host is None:
         notes.append('stand skipped (needs solid parts)')
-        return None
+        return None, 0.0
     va, _, _ = solid_mesh(host)
     zmin, zmax = va[:, 2].min(), va[:, 2].max()
     low = va[va[:, 2] <= zmin + 0.3 * (zmax - zmin)]
@@ -829,8 +829,8 @@ def pillar_stand(parts, n_pillars=3, pillar_d=3.0, plate_t=2.0, gap=4.0, margin=
     shift = -(zmin - gap - plate_t)
     _shift(parts, shift)
     stand = stand.translate((0, 0, shift))
-    notes.append('stand: %.0f mm plate, %d pillars %.1f mm thick' % (plate_t, len(picks), pillar_d))
-    return stand
+    notes.append('stand: %.1f mm plate, %d pillars %.1f mm thick' % (plate_t, len(picks), pillar_d))
+    return stand, shift
 
 
 # ---------------------------------------------------------------------------
@@ -1225,3 +1225,37 @@ def part_output(p):
     tcan = canon[ta]
     used, inv = np.unique(tcan.ravel(), return_inverse=True)
     return vp[used, :3], inv.reshape(-1, 3), tc
+
+
+def auto_segments(radius_mm, tol_mm, lo=12, hi=48):
+    """Facets around a rod so the flat facets stay within tol_mm of the true
+    circle (e.g. half a layer height): smooth where it shows, small files."""
+    import math
+    if radius_mm <= tol_mm:
+        return lo
+    n = int(math.ceil(math.pi / math.acos(1.0 - tol_mm / radius_mm)))
+    n += n % 2
+    return max(lo, min(hi, n))
+
+
+def mesh_cgo(va, ta, tc):
+    """PyMOL CGO triangle list (flat-shaded) for a preview of a printed part."""
+    from pymol import cgo
+    va = np.asarray(va, float)
+    ta = np.asarray(ta, np.int64)
+    v0, v1, v2 = va[ta[:, 0]], va[ta[:, 1]], va[ta[:, 2]]
+    n = np.cross(v1 - v0, v2 - v0)
+    ln = np.linalg.norm(n, axis=1)
+    ln[ln == 0] = 1
+    n /= ln[:, None]
+    col = np.asarray(tc, float)[:, :3] / 255.0
+    m = len(ta)
+    rec = np.empty((m, 20))
+    rec[:, 0] = cgo.COLOR
+    rec[:, 1:4] = col
+    rec[:, 4] = cgo.NORMAL
+    rec[:, 5:8] = n
+    for k, v in enumerate((v0, v1, v2)):
+        rec[:, 8 + 4 * k] = cgo.VERTEX
+        rec[:, 9 + 4 * k:12 + 4 * k] = v
+    return [cgo.BEGIN, cgo.TRIANGLES] + rec.ravel().tolist() + [cgo.END]

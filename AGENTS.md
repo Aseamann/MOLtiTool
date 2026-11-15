@@ -72,6 +72,7 @@ All GUI code is in `make_panel()` in `script_hub.py` (class `Hub`). `_print_tab`
 - `_reg(section, key, widget)`: registers a field so presets save/load it. **`key` must equal the keyword argument of the function you call**, so `self._values(section)` can be passed straight through: `print3d.my_cmd(**self._values('my_section'))`
 - `_run(label, fn, *args, **kwargs)`: calls a command, shows "done"/errors in the status line and prints tracebacks to the PyMOL log
 - `_say(text, error=False)`: status line
+- `_help(layout, key)`: fold-out "About" text from the `HELP` dict at the top of the file; add one to every new section
 
 Steps: write the command in `print3d.py` (or a new module) and register it with `cmd.extend`; add a `QGroupBox` in `_print_tab` with fields registered under a new section name; connect a button to `self._run(...)`; if the command should remember options for presets, store them in `print3d._last['section']`.
 
@@ -88,7 +89,9 @@ Qt: import from `pymol.Qt` (never PyQt5/PySide directly) and use `_enum(QtCore.Q
 4. Optional `pc.snap_to_palette` to the user's filaments.
 5. `pc.build_parts`: one `Part` per color, the boolean union of its pieces. Colors live in manifold3d vertex properties (channels 3-5, rgb 0-1), so booleans keep them.
 6. `pc.snapfit`, `pc.attach_floating`, `pc.flat_cut` / `pc.pillar_stand`, `pc.separate_colors`.
-7. `pc.analyze` + `_thin_features` give the report; `_write_group` writes 3MF (`pc.write_3mf`), OBJ or STL using `pc.part_output` (welded meshes).
+7. `pc.analyze` + `_thin_features` give the report; `_write_group` writes 3MF (`pc.write_3mf`), OBJ or STL using `pc.part_output` (welded meshes). With `preview=1` the parts are mapped back to Angstrom (`Placement.inverse`, undoing the base's z shift) and loaded as CGO (`pc.mesh_cgo`) named `preview_*`; exports always skip `preview_*` objects.
+
+Nozzle and layer height (`nozzle`, `layer_height`) drive every option left at 0 ("auto"): thinnest feature, fit and socket clearances, pillar size, base sizes rounded to whole layers and rod facets (`pc.auto_segments`). New print-related options should follow the same pattern instead of hard-coding millimetres.
 
 Keep PyMOL calls in `print3d.py` and geometry in `print3d_core.py`, so the core stays testable without PyMOL.
 
@@ -101,7 +104,7 @@ Keep PyMOL calls in `print3d.py` and geometry in `print3d_core.py`, so the core 
 - Cartoon segments take the color of their CA atom unless `cartoon_color` is set.
 - `cmd.create` copies atom colors and representations, but not object-level settings. Copy them with `cmd.get_object_settings`.
 - Hex colors work as `0xRRGGBB`.
-- Struts are CGO objects; their ownership per object is tracked in `print3d._struts_registry`.
+- Struts are CGO objects. `print3d._struts_registry[name]` holds `dict(struts=[dict(p1, p2, m1, m2)], radius, color)`; `color=None` means each half takes its chain's color (`_chain_color_lookup`), recomputed whenever struts are drawn or exported.
 
 ## manifold3d quirks
 

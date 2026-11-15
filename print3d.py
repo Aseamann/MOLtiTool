@@ -42,6 +42,11 @@ colorprint filename [, objects, format, each, size_mm, mm_per_A, orient,
       single_color=1  one file per color for single-filament printers; pieces
                    plug into sockets in the bigger pieces
       base=cut|stand  flat bottom, or a plate with pillars
+      nozzle, layer_height  what to tune for (default 0.4 / 0.2 mm): sets the
+                   thinnest-feature warning, fit and socket clearances, pillar
+                   size, base sizes in whole layers and rod smoothness
+      preview=1    build it all but show it in PyMOL (preview_<name> objects,
+                   in place over the molecule) instead of writing files
     It also joins loose pieces (e.g. side chains ending just off the cartoon)
     with short rods and prints a report: size, filament grams, parts thinner
     than min_feature (default 1.5 mm), anything still floating, bed contact.
@@ -91,7 +96,7 @@ _HELIX_FACTOR = 2.0      # cartoon_oval_length/width are half sizes
 _STRAND_FACTOR = 1.414   # cartoon_rect_length/width
 _LOOP_FACTOR = 2.0       # cartoon_loop_radius is a radius
 
-_struts_registry = {}    # name -> dict(struts=[(i1, i2, xyz1, xyz2, obj1, obj2)], radius, rgb)
+_struts_registry = {}    # name -> dict(struts=[dict(p1, p2, m1, m2)], radius, color=None|rgb)
 
 
 def _f(x):
@@ -202,24 +207,97 @@ def _short_connection(i1, i2, dmax, sc):
     return False
 
 
-def _strut_cgo(struts, radius, rgb):
+def _chain_color_lookup(s):
+    """Returns color_of(model, xyz) -> rgb: the color of the chain the atom at
+    xyz belongs to (the chain's cartoon_color if set, else its most common CA
+    color), so struts match their chain."""
+    cache = {}
+
+    def model_info(model):
+        if model in cache:
+            return cache[model]
+        from pymol import stored
+        stored._p3d = []
+        s.iterate(model, 'stored._p3d.append((chain, name, color))')
+        rows = stored._p3d
+        xyz = s.get_coords(model)
+        obj_cc = str(s.get('cartoon_color', model))
+        chain_rgb = {}
+        by_chain = {}
+        for ch, nm, col in rows:
+            if nm == 'CA':
+                by_chain.setdefault(ch, []).append(col)
+        for ch, cols in by_chain.items():
+            if obj_cc not in ('default', '-1'):
+                chain_rgb[ch] = tuple(s.get_color_tuple(obj_cc))
+            else:
+                best = max(set(cols), key=cols.count)
+                chain_rgb[ch] = tuple(s.get_color_tuple(best))
+        info = (np.asarray(xyz, float) if xyz is not None else np.zeros((0, 3)),
+                [r[0] for r in rows], [r[2] for r in rows], chain_rgb)
+        cache[model] = info
+        return info
+
+    def color_of(model, p):
+        try:
+            xyz, chains, cols, chain_rgb = model_info(model)
+        except Exception:
+            return (0.7, 0.7, 0.7)
+        if not len(xyz):
+            return (0.7, 0.7, 0.7)
+        i = int(np.argmin(((xyz - np.asarray(p, float)) ** 2).sum(1)))
+        ch = chains[i]
+        if ch in chain_rgb:
+            return chain_rgb[ch]
+        return tuple(s.get_color_tuple(cols[i]))
+    return color_of
+
+
+def _strut_cgo(struts, radius, color, s=cmd):
+    """CGO rods. color None = each half takes the color of its end's chain."""
+    color_of = _chain_color_lookup(s) if color is None else None
     obj = []
     for st in struts:
-        p1, p2 = st[2], st[3]
-        obj += [cgo.SAUSAGE] + list(map(float, p1)) + list(map(float, p2)) + \
-               [float(radius)] + list(rgb) + list(rgb)
+        p1, p2 = np.asarray(st['p1'], float), np.asarray(st['p2'], float)
+        if color is not None:
+            c1 = c2 = tuple(color)
+        else:
+            c1, c2 = color_of(st['m1'], p1), color_of(st['m2'], p2)
+        if c1 == c2:
+            segs = [(p1, p2, c1)]
+        else:                          # two halves, one per chain color
+            mid = (p1 + p2) / 2
+            segs = [(p1, mid, c1), (mid, p2, c2)]
+        for a, b, c in segs:
+            obj += [cgo.SAUSAGE] + list(map(float, a)) + list(map(float, b)) + \
+                   [float(radius)] + list(c) + list(c)
     return obj
 
 
 def _draw_struts(name, s):
     entry = _struts_registry.get(name)
+    was_enabled = name not in s.get_names('objects') or name in s.get_names('objects', enabled_only=1)
     s.delete(name)
     if entry and entry['struts']:
-        s.load_cgo(_strut_cgo(entry['struts'], entry['radius'], entry['rgb']), name)
+        s.load_cgo(_strut_cgo(entry['struts'], entry['radius'], entry['color'], s), name)
+        if not was_enabled:
+            s.disable(name)
+
+
+def _rgb_or_none(color, s):
+    """'' / 'auto' / 'chain' -> None (chain colors), else an rgb tuple."""
+    if color is None or (isinstance(color, str) and color.strip().lower() in ('', 'auto', 'chain')):
+        return None
+    if isinstance(color, (tuple, list)):
+        return tuple(float(x) for x in color)
+    c = str(color).strip()
+    if c.startswith('#'):
+        c = '0x' + c[1:]
+    return tuple(s.get_color_tuple(c))
 
 
 def struts(selection='name CA', length=8.0, loop=60.0, radius=0.5,
-           color='grey70', name='struts', replace=1, _self=cmd):
+           color='', name='struts', replace=1, _self=cmd):
     """
 DESCRIPTION
 
@@ -227,9 +305,16 @@ DESCRIPTION
     are within "length" Angstroms in space but more than "loop" Angstroms
     apart through bonds (or through struts already added).
 
+    color: blank (default) = each strut takes the color of its chain; give a
+    color (e.g. grey70) to use one color for all.
+
 USAGE
 
     struts [selection [, length [, loop [, radius [, color [, name [, replace ]]]]]]]
+
+SEE ALSO
+
+    strut_add, strut_remove, struts_delete
     """
     s = _self
     length, loop, radius = _f(length), _f(loop), _f(radius)
@@ -255,36 +340,138 @@ USAGE
     for i1, i2, d in _connections(sel_idx, adj, loop):
         sc.setdefault(i1, []).append((i2, d))
     previous = [] if _b(replace) else list(_struts_registry.get(name, {}).get('struts', []))
-    for i1, i2, p1, p2, _m1, _m2 in previous:
-        d = float(np.linalg.norm(np.subtract(p1, p2)))
-        sc.setdefault(i1, []).append((i2, d))
-        sc.setdefault(i2, []).append((i1, d))
+
+    def key(p):
+        return tuple(int(round(float(v) * 100)) for v in p)
+    pos_index = {key(xyz[i]): i for i in sel_idx}
+    for st in previous:     # existing struts count as connections
+        i1, i2 = pos_index.get(key(st['p1'])), pos_index.get(key(st['p2']))
+        if i1 is not None and i2 is not None:
+            d = float(np.linalg.norm(np.subtract(st['p1'], st['p2'])))
+            sc.setdefault(i1, []).append((i2, d))
+            sc.setdefault(i2, []).append((i1, d))
 
     new = []
     for d2, i1, i2 in pairs:
         if not _short_connection(i1, i2, loop, sc):
             d = float(np.sqrt(d2))
             # remember which object each end belongs to (for per-object export)
-            new.append((i1, i2, xyz[i1].copy(), xyz[i2].copy(), keys[i1][0], keys[i2][0]))
+            new.append(dict(p1=xyz[i1].copy(), p2=xyz[i2].copy(),
+                            m1=keys[i1][0], m2=keys[i2][0]))
             sc.setdefault(i1, []).append((i2, d))
             sc.setdefault(i2, []).append((i1, d))
 
     _last['struts'] = dict(selection=selection, length=length, loop=loop, radius=radius,
-                           color=color if isinstance(color, str) else 'grey70')
-    all_struts = previous + new
-    rgb = s.get_color_tuple(color) if not isinstance(color, (tuple, list)) else tuple(color)
-    _struts_registry[name] = dict(struts=all_struts, radius=radius, rgb=rgb)
+                           color=color if isinstance(color, str) else '')
+    _struts_registry[name] = dict(struts=previous + new, radius=radius,
+                                  color=_rgb_or_none(color, s))
     _draw_struts(name, s)
-    _msg(['created %d struts for "%s" (max length %.3g, loop %.3g), object "%s"'
-          % (len(new), selection, length, loop, name)])
+    _msg(['created %d struts for "%s" (max length %.3g, loop %.3g), object "%s"%s'
+          % (len(new), selection, length, loop, name,
+             ', colored by chain' if _struts_registry[name]['color'] is None else '')])
     return len(new)
+
+
+def _one_atom(sel, s):
+    """(model, xyz, label) for a selection of one atom or one residue (its CA)."""
+    m = s.get_model(sel)
+    atoms = m.atom
+    if len(atoms) != 1:
+        ca = [a for a in atoms if a.name == 'CA']
+        residues = {(a.model, a.chain, a.resi) for a in atoms}
+        if len(ca) == 1 and len(residues) == 1:
+            atoms = ca
+        else:
+            raise ValueError('"%s" must be one atom or one residue (has %d atoms)'
+                             % (sel, len(m.atom)))
+    a = atoms[0]
+    return a.model, np.array(a.coord, float), '%s/%s/%s%s/%s' % (a.model, a.chain, a.resn, a.resi, a.name)
+
+
+def strut_add(atom1, atom2, name='struts', radius=-1.0, color='', _self=cmd):
+    """
+DESCRIPTION
+
+    Add one strut between two atoms (or two residues: their CA atoms).
+
+USAGE
+
+    strut_add atom1, atom2 [, name [, radius [, color ]]]
+
+EXAMPLE
+
+    strut_add /DN3//A/45/CA, /DN3//A/112/CA
+    strut_add chain A and resi 45, chain A and resi 112
+    """
+    s = _self
+    try:
+        m1, p1, l1 = _one_atom(atom1, s)
+        m2, p2, l2 = _one_atom(atom2, s)
+    except ValueError as e:
+        print(' strut_add: %s' % e)
+        return
+    entry = _struts_registry.get(name)
+    if entry is None:
+        entry = _struts_registry[name] = dict(struts=[], radius=0.5, color=None)
+    if float(radius) > 0:
+        entry['radius'] = float(radius)
+    if str(color).strip():
+        entry['color'] = _rgb_or_none(color, s)
+    entry['struts'].append(dict(p1=p1, p2=p2, m1=m1, m2=m2))
+    _draw_struts(name, s)
+    _msg(['strut added %s -- %s (%.1f A), object "%s"' % (l1, l2, np.linalg.norm(p1 - p2), name)])
+    return True
+
+
+def strut_remove(atom1, atom2='', name='', _self=cmd):
+    """
+DESCRIPTION
+
+    Remove the strut between atom1 and atom2, or (atom2 blank) every strut
+    touching atom1. Atoms can be given as one atom or one residue (its CA).
+
+USAGE
+
+    strut_remove atom1 [, atom2 [, name ]]
+    """
+    s = _self
+    try:
+        _, p1, l1 = _one_atom(atom1, s)
+        p2 = _one_atom(atom2, s)[1] if str(atom2).strip() else None
+    except ValueError as e:
+        print(' strut_remove: %s' % e)
+        return
+    def near(a, b):
+        return float(np.linalg.norm(np.asarray(a, float) - np.asarray(b, float))) < 0.05
+    removed = 0
+    for nm in ([name] if name else list(_struts_registry)):
+        entry = _struts_registry.get(nm)
+        if not entry:
+            continue
+        keep = []
+        for st in entry['struts']:
+            hit1 = near(st['p1'], p1) or near(st['p2'], p1)
+            if p2 is None:
+                hit = hit1
+            else:
+                hit = (near(st['p1'], p1) and near(st['p2'], p2)) or \
+                      (near(st['p1'], p2) and near(st['p2'], p1))
+            if hit:
+                removed += 1
+            else:
+                keep.append(st)
+        if len(keep) != len(entry['struts']):
+            entry['struts'] = keep
+            _draw_struts(nm, s)
+    _msg(['removed %d strut(s) at %s' % (removed, l1)])
+    return removed
 
 
 def struts_delete(name='struts', _self=cmd):
     """
 DESCRIPTION
 
-    Delete a struts object made by "struts".
+    Delete a whole struts object made by "struts".
     """
     _struts_registry.pop(name, None)
     _self.delete(name)
@@ -382,12 +569,9 @@ def _reassign_struts(part_names, s):
         for xyz in s.get_coords(p) if s.count_atoms(p) else []:
             lookup[key(xyz)] = p
     for entry in _struts_registry.values():
-        fixed = []
-        for i1, i2, p1, p2, m1, m2 in entry['struts']:
-            m1 = lookup.get(key(p1), m1)
-            m2 = lookup.get(key(p2), m2)
-            fixed.append((i1, i2, p1, p2, m1, m2))
-        entry['struts'] = fixed
+        for st in entry['struts']:
+            st['m1'] = lookup.get(key(st['p1']), st['m1'])
+            st['m2'] = lookup.get(key(st['p2']), st['m2'])
 
 
 def _safe(name):
@@ -488,11 +672,12 @@ _connectors = []          # list of dict(host, guest, kind, ...)
 _last = {}                # last-used options per section (for presets)
 
 EXPORT_DEFAULTS = dict(objects='', format='3mf', each=0, size_mm=0.0, mm_per_A=1.0,
+                       nozzle=0.4, layer_height=0.2, preview=0,
                        orient='view', filaments='', base='none', base_depth=1.0,
-                       pillars=3, pillar_d=3.0, min_feature=1.5, attach=1, attach_mm=4.0,
-                       single_color=0, socket_clearance=0.15,
+                       pillars=3, pillar_d=0.0, min_feature=0.0, attach=1, attach_mm=4.0,
+                       single_color=0, socket_clearance=0.0,
                        union=1, close_ends=1,
-                       round_ends=1, segments=24, color_tolerance=0)
+                       round_ends=1, segments=0, color_tolerance=0)
 
 
 def _scene_vrml(s):
@@ -512,6 +697,9 @@ def _scene_vrml(s):
 
 def _vrml_of(s, names, temp_cgo=None):
     restore = None
+    if not names:       # "everything shown", but never the preview objects
+        names = [n for n in s.get_names('objects', enabled_only=1)
+                 if not n.startswith('preview_')]
     if temp_cgo:
         s.load_cgo(temp_cgo[1], temp_cgo[0])
         names = list(names) + [temp_cgo[0]]
@@ -675,6 +863,7 @@ def _write_group(parts, fmt, path_stem, ext, label, slot_of, palette_names, line
 
 
 def colorprint(filename, objects='', format='', each=-1, size_mm=-1.0, mm_per_A=-1.0,
+               nozzle=-1.0, layer_height=-1.0, preview=-1,
                orient='', filaments=None, base='', base_depth=-1.0, pillars=-1,
                pillar_d=-1.0, min_feature=-1.0, attach=-1, attach_mm=-1.0,
                single_color=-1, socket_clearance=-1.0, union=-1,
@@ -702,7 +891,14 @@ ARGUMENTS
     filaments = colors loaded in slots 1, 2, 3... e.g. "cyan orange blue green";
                 every color is snapped to the closest filament
     base = none | cut (flat bottom, base_depth mm) | stand (plate + pillars)
-    min_feature = warn below this thickness in mm (default 1.5)
+    nozzle, layer_height = what to optimize for (default 0.4 / 0.2 mm). They
+             set the defaults below whenever those are 0 (= auto): thinnest
+             feature 3.75 x nozzle, fit clearance nozzle/2, socket clearance
+             0.4 x nozzle, pillar thickness 7.5 x nozzle (>= 3 mm), base sizes in
+             whole layers and rod smoothness within half a layer
+    preview = 1: build everything but load it into PyMOL as objects named
+             preview_<name> (in place over the molecule) instead of writing files
+    min_feature = warn below this thickness in mm (0 = auto)
     single_color = 1: for printers with one filament: every color becomes its
              own file of separate pieces (print each in its color, then glue;
              bigger pieces get sockets for the smaller ones)
@@ -715,6 +911,7 @@ ARGUMENTS
     if preset:
         opts.update(_load_presets().get(str(preset), {}).get('export', {}))
     given = dict(objects=objects, format=format, each=each, size_mm=size_mm, mm_per_A=mm_per_A,
+                 nozzle=nozzle, layer_height=layer_height, preview=preview,
                  orient=orient, filaments=filaments, base=base, base_depth=base_depth,
                  pillars=pillars, pillar_d=pillar_d, min_feature=min_feature, attach=attach,
                  attach_mm=attach_mm, single_color=single_color,
@@ -742,6 +939,22 @@ ARGUMENTS
     each = _b(o['each'])
     size_mm, mm_per_A = float(o['size_mm']), float(o['mm_per_A'])
     segments, tol = int(float(o['segments'])), int(float(o['color_tolerance']))
+    preview = _b(o['preview'])
+
+    # ---- printer: nozzle + layer height set the auto values ----
+    nz = max(float(o['nozzle']), 0.05)
+    lh = max(float(o['layer_height']), 0.02)
+
+    def layers(x, min_layers=1):            # round up to whole layers
+        import math
+        return max(min_layers, math.ceil(float(x) / lh - 1e-6)) * lh
+    min_feature = float(o['min_feature']) or round(3.75 * nz, 2)
+    socket_c = float(o['socket_clearance']) or round(0.4 * nz, 2)
+    fit_c = round(0.5 * nz, 2)
+    pillar_d = float(o['pillar_d']) or max(3.0, round(7.5 * nz, 1))
+    base_depth = layers(o['base_depth'], 2)
+    plate_t = layers(max(2.0, 8 * lh), 4)
+    stand_gap = layers(4.0)
     names = str(o['objects']).replace(',', ' ').split()
     missing = [n for n in names if n not in s.get_names('all')]
     if missing:
@@ -750,33 +963,47 @@ ARGUMENTS
     _last['export'] = {k: o[k] for k in EXPORT_DEFAULTS}
     solid_ok = pc.have_manifold()
 
+    # struts colored by chain follow any recoloring done since they were made
+    for sname, e in list(_struts_registry.items()):
+        if e.get('color') is None and sname in s.get_names('objects'):
+            _draw_struts(sname, s)
+
     # ---- what to export: one group, or one per object (struts follow) ----
     groups = []                     # (label, names, temp_cgo)
     if each:
-        targets = names or s.get_names('objects', enabled_only=1)
+        targets = [n for n in (names or s.get_names('objects', enabled_only=1))
+                   if not n.startswith('preview_')]
         strut_objs = [n for n in targets if n in _struts_registry] if names else \
             [n for n in _struts_registry if n in targets]
         for obj in [n for n in targets if n not in _struts_registry]:
-            sub, radius, rgb = [], 0.5, (0.7, 0.7, 0.7)
+            cgo_list = []
+            nsub = 0
             for sname in strut_objs:
                 e = _struts_registry[sname]
-                radius, rgb = e['radius'], e['rgb']
-                sub += [st for st in e['struts'] if st[4] == obj and st[5] == obj]
-            temp = ('_p3d_struts_tmp', _strut_cgo(sub, radius, rgb)) if sub else None
+                sub = [st for st in e['struts'] if st['m1'] == obj and st['m2'] == obj]
+                nsub += len(sub)
+                cgo_list += _strut_cgo(sub, e['radius'], e['color'], s)
+            temp = ('_p3d_struts_tmp', cgo_list) if cgo_list else None
             groups.append((obj, [obj], temp))
     else:
         label = names[0] if len(names) == 1 else os.path.basename(stem)
         groups.append((label, names, None))
 
     notes_all = []
-    raw = []
-    for label, gnames, temp in groups:
-        notes, info = [], {}
-        pieces = pc.vrml_to_pieces(_vrml_of(s, gnames, temp), segments, _b(o['round_ends']),
-                                   _b(o['close_ends']), notes, info)
-        if pieces:
-            raw.append(dict(label=label, names=gnames or s.get_names('objects', enabled_only=1),
-                            pieces=pieces, radii=info.get('radii', []), notes=notes))
+    vrmls = [(label, gnames, _vrml_of(s, gnames, temp)) for label, gnames, temp in groups]
+
+    def tessellate(seg):
+        out = []
+        for label, gnames, vr in vrmls:
+            notes, info = [], {}
+            pieces = pc.vrml_to_pieces(vr, seg, _b(o['round_ends']), _b(o['close_ends']),
+                                       notes, info)
+            if pieces:
+                out.append(dict(label=label, names=gnames or [
+                    n for n in s.get_names('objects', enabled_only=1) if not n.startswith('preview_')],
+                                pieces=pieces, radii=info.get('radii', []), notes=notes))
+        return out
+    raw = tessellate(segments or 12)
     if not raw:
         print(' colorprint: nothing shown to export')
         return
@@ -785,6 +1012,12 @@ ARGUMENTS
     rot = pc.view_rotation(s.get_view()) if str(o['orient']).lower() == 'view' else None
     allpts = np.vstack([va for g in raw for va, _, _ in g['pieces']])
     pl = pc.make_placement(allpts, rot, mm_per_A, size_mm)
+    if not segments:      # auto: facets within half a layer of the true rod surface
+        radii = [r for g in raw for _, r in g['radii']]
+        if radii:
+            segments = pc.auto_segments(float(np.median(radii)) * pl.scale, lh / 2)
+            if segments != 12:
+                raw = tessellate(segments)
 
     # ---- filament palette ----
     pal = _parse_colors(o['filaments'], s) if o['filaments'] else []
@@ -842,25 +1075,27 @@ ARGUMENTS
             notes_all.append('connectors need manifold3d')
             continue
         pc.snapfit(gh['parts'], gg['parts'], None, None, con['kind'], float(con['diameter']),
-                   float(con['length']), float(con['clearance']), float(con['wall']),
+                   float(con['length']), float(con['clearance']) or fit_c, float(con['wall']),
                    float(con['magnet_d']), float(con['magnet_h']), notes=gh['notes'])
 
     # ---- join loose pieces (side chains just off the cartoon, etc.) ----
     if solid_ok and _b(o['attach']):
         for g in raw:
             pc.attach_floating(g['parts'], float(o['attach_mm']),
-                               max(float(o['min_feature']), 1.2), notes=g['notes'])
+                               max(min_feature, 2.5 * nz), notes=g['notes'])
 
     # ---- base on the biggest object ----
     main = max(raw, key=lambda g: sum(len(p.get_mesh()[1]) for p in g['parts']))
     bmode = str(o['base']).lower()
     if bmode in ('cut', 'stand') and not solid_ok:
         notes_all.append('base needs manifold3d')
-    elif bmode == 'cut':
-        main['parts'] = pc.flat_cut(main['parts'], float(o['base_depth']), main['notes'])
-    elif bmode == 'stand':
-        stand = pc.pillar_stand(main['parts'], int(float(o['pillars'])), float(o['pillar_d']),
-                                notes=main['notes'])
+    for g in raw:
+        g['zshift'] = 0.0
+    if bmode == 'cut' and solid_ok:
+        main['parts'], main['zshift'] = pc.flat_cut(main['parts'], base_depth, main['notes'])
+    elif bmode == 'stand' and solid_ok:
+        stand, main['zshift'] = pc.pillar_stand(main['parts'], int(float(o['pillars'])), pillar_d,
+                                                plate_t=plate_t, gap=stand_gap, notes=main['notes'])
         if stand is not None:
             c = max(main['parts'], key=lambda p: p.volume()).color
             main['parts'].append(pc.Part(c, solid=pc.tint(stand, c), name='stand'))
@@ -869,8 +1104,7 @@ ARGUMENTS
     if single:
         if solid_ok:
             for g in raw:
-                g['parts'] = pc.separate_colors(g['parts'], float(o['socket_clearance']),
-                                                g['notes'])
+                g['parts'] = pc.separate_colors(g['parts'], socket_c, g['notes'])
         else:
             notes_all.append('single-color pieces without sockets (manifold3d not installed)')
 
@@ -878,6 +1112,9 @@ ARGUMENTS
     out_files, report = [], []
     report.append('scale %.2f mm per A, %s' % (pl.scale, 'oriented as on screen'
                                                 if rot is not None else 'molecule frame'))
+    report.append('tuned for %.2f mm nozzle, %.2f mm layers: thinnest feature %.2f mm, fit '
+                  'clearance %.2f mm, socket clearance %.2f mm, %d facets per rod'
+                  % (nz, lh, min_feature, fit_c, socket_c, segments))
     if pal:
         report.append('filaments: ' + ', '.join('%d=%s' % (i + 1, n) for i, (n, _) in enumerate(pal)))
         report.append('   colors mapped: ' + ', '.join(
@@ -901,7 +1138,7 @@ ARGUMENTS
                     slot_of(p.color), p.volume() / 1000 * pc.PLA_DENSITY))
         if per:
             report.append('   ' + '; '.join(per))
-        for w in _thin_features(s, g['names'], g['radii'], pl.scale, float(o['min_feature'])):
+        for w in _thin_features(s, g['names'], g['radii'], pl.scale, min_feature):
             report.append('   thin: ' + w)
         bodies = a.get('bodies') or []
         if len(bodies) > 1:
@@ -909,11 +1146,22 @@ ARGUMENTS
             report.append('   floating: %d piece(s) not attached to the main body: %s'
                           % (len(fl), '; '.join('%.0f mm3 near %s' % (v, n) for v, _, n in fl[:6])
                                                + (' ...' if len(fl) > 6 else '')))
-        if a.get('bed_contact') is not None and bmode != 'stand':
+        if a.get('bed_contact') is not None and not (g is main and bmode in ('stand', 'cut')):
             report.append('   bed contact %.0f mm2%s' % (a['bed_contact'], ' (small: supports '
                           'or base=cut/stand recommended)' if a['bed_contact'] < 30 else ''))
         report += ['   ' + n for n in g['notes'] if not n.startswith('Read ')]
         path_stem = _file_for(stem, '', g['label'], each)
+        if preview:
+            cg = []
+            for prt in parts:
+                va, ta, tc = pc.part_output(prt)
+                va = pl.inverse(va - np.array([0.0, 0.0, g.get('zshift', 0.0)]))
+                cg += pc.mesh_cgo(va, ta, tc)
+            pname = 'preview_' + _safe(g['label'])
+            s.delete(pname)
+            s.load_cgo(cg, pname)
+            out_files.append(pname)
+            continue
         if single:
             for prt in parts:
                 cname = _safe(_color_name(prt.color, pal_names).lstrip('#'))
@@ -935,6 +1183,12 @@ ARGUMENTS
             out_files += _write_group(parts, fmt, path_stem, ext, g['label'], slot_of,
                                       pal_names, report)
     report += notes_all
+    if preview:
+        report.append('preview loaded: %s (nothing written; hide with: disable preview_*, '
+                      'remove with: delete preview_*)' % ', '.join(out_files))
+        _msg(report)
+        _last['report'] = report
+        return ', '.join(out_files)
     report.append('wrote: ' + ', '.join(os.path.basename(f) for f in out_files))
     if fmt == 'stl' and not single:
         report.append('load the STLs together as ONE object with multiple parts')
@@ -947,7 +1201,7 @@ ARGUMENTS
 # snap-fit connectors
 # ---------------------------------------------------------------------------
 
-def snapfit(host, guest, kind='peg', diameter=4.0, length=6.0, clearance=0.2,
+def snapfit(host, guest, kind='peg', diameter=4.0, length=6.0, clearance=0.0,
             magnet_d=6.0, magnet_h=3.0, wall=1.6, _self=cmd):
     """
 DESCRIPTION
@@ -963,6 +1217,7 @@ USAGE
             [, magnet_d [, magnet_h [, wall ]]]]]]]
 
     kind = peg | magnet
+    clearance = gap for the fit in mm (0 = auto: half the nozzle size)
     """
     s = _self
     for n in (host, guest):
@@ -1099,6 +1354,8 @@ DESCRIPTION
 cmd.extend('printstyle', printstyle)
 cmd.extend('struts', struts)
 cmd.extend('struts_delete', struts_delete)
+cmd.extend('strut_add', strut_add)
+cmd.extend('strut_remove', strut_remove)
 cmd.extend('glycan_surface', glycan_surface)
 cmd.extend('split_parts', split_parts)
 cmd.extend('colorprint', colorprint)
@@ -1107,6 +1364,10 @@ cmd.extend('snapfit_clear', snapfit_clear)
 cmd.extend('print3d_preset', print3d_preset)
 cmd.extend('print3d_install_merge', print3d_install_merge)
 cmd.auto_arg[0]['struts'] = cmd.auto_arg[0]['zoom']
+cmd.auto_arg[0]['strut_add'] = cmd.auto_arg[0]['zoom']
+cmd.auto_arg[1]['strut_add'] = cmd.auto_arg[0]['zoom']
+cmd.auto_arg[0]['strut_remove'] = cmd.auto_arg[0]['zoom']
+cmd.auto_arg[1]['strut_remove'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[0]['glycan_surface'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[0]['split_parts'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[0]['snapfit'] = cmd.auto_arg[0]['disable']

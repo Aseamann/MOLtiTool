@@ -10,12 +10,12 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
 
 **Script Hub** (`script_hub.py`): a panel docked in PyMOL.
 - **Scripts tab:** lists every `.py` file in this folder together with the commands each one adds (found automatically, without running anything). Pick a command, fill in a form generated from its arguments and press Run. The exact command line appears in the PyMOL log. Drop a new script into the folder and press Refresh.
-- **3D Print tab:** the print3d tools below, with presets.
+- **3D Print tab:** the print3d tools below, with presets and a fold-out "About" note in every section.
 
 **print3d** (`print3d.py`, `print3d_core.py`): from PyMOL scene to print.
 - `printstyle`: thicker cartoon (helix, strand, loop) and sticks, in real Angstrom widths
 - `split_parts`: separate ligands (each glycan, say) or chains into their own objects, each surfaced on its own so nothing cuts into it
-- `struts`: support rods between residues close in space but far along the chain (same rules as ChimeraX `struts`)
+- `struts`: support rods between residues close in space but far along the chain (same rules as ChimeraX `struts`), colored like their chain; `strut_add` / `strut_remove` edit single struts
 - `snapfit`: join two separately printed parts at their contact with a peg and walled socket, or magnet pockets, with a seat cut to shape and print clearance
 - `colorprint`: export with your colors
   - **3MF** opens ready to slice in OrcaSlicer, Anycubic Slicer Next and Bambu Studio, with every part already on its filament slot (and painted where colors mix)
@@ -24,6 +24,8 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
   - colors snapped to the filaments you have loaded
   - **single-color printer mode:** one file per color, smaller pieces plug into sockets in bigger ones
   - optional flat-cut bottom or a stand with pillars
+  - tuned to your nozzle and layer height (thinnest feature, fit clearances, base sizes in whole layers)
+  - **Preview in PyMOL**: see the finished print (base, pegs, rods, colors) over your molecule before writing anything
   - loose pieces (side chains that end just off the cartoon) joined with short rods
   - a report: size, grams of filament, parts thinner than your nozzle can handle, anything still floating, bed contact
 - `print3d_preset`: save and reuse whole setups by name
