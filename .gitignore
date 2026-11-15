@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# personal presets saved by the Script Hub
+print3d_presets.json
+
+# exported models
+*.3mf
+*.stl
+*.obj
+
+# local files kept out of the public repo
+.pymolrc_baker.py
+unfold_jalpha.py
+*.cif
+*.pdb
