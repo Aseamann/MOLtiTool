@@ -72,11 +72,14 @@ All GUI code is in `make_panel()` in `script_hub.py` (class `Hub`). `_print_tab`
 - `_reg(section, key, widget)`: registers a field so presets save/load it. **`key` must equal the keyword argument of the function you call**, so `self._values(section)` can be passed straight through: `print3d.my_cmd(**self._values('my_section'))`
 - `_run(label, fn, *args, **kwargs)`: calls a command, shows "done"/errors in the status line and prints tracebacks to the PyMOL log
 - `_say(text, error=False)`: status line
+- Reset buttons are added automatically by `_add_resets` after the tab is built: every registered field gets one, with the value it had at build time as its default. Set a widget's default before `_print_tab` returns and it just works.
 - `_help(layout, key)`: fold-out "About" text from the `HELP` dict at the top of the file; add one to every new section
 
 Steps: write the command in `print3d.py` (or a new module) and register it with `cmd.extend`; add a `QGroupBox` in `_print_tab` with fields registered under a new section name; connect a button to `self._run(...)`; if the command should remember options for presets, store them in `print3d._last['section']`.
 
-Presets (`print3d_presets.json`) are `{name: {section: {key: value}}}` and are shared by the GUI and the `print3d_preset` command.
+Presets (`print3d_presets.json`) are `{name: {section: {key: value}}}` and are shared by the GUI and the `print3d_preset` command. Sections: `style` (printstyle), `surface` (surfacestyle), `struts`, `split`, `snapfit`, `export` (colorprint, including the printer fields). Built-in presets live in `BUILTIN_PRESETS` in `print3d.py`; `all_presets()` merges them with the user's file, and saving or deleting a built-in name is refused in both the command and the GUI.
+
+Printer profiles are the `PRINTERS` dict in `print3d.py` (`bed` = build volume X, Y, Z in mm from the maker's spec sheet, `slots` = filaments the stock multicolor unit holds). Add a printer there and it appears in the GUI combo and in `print3d_printers`.
 
 Qt: import from `pymol.Qt` (never PyQt5/PySide directly) and use `_enum(QtCore.Qt, 'Name', 'Enum.Name')` for enums, so both Qt5 and Qt6 builds of PyMOL work.
 
@@ -91,6 +94,12 @@ Qt: import from `pymol.Qt` (never PyQt5/PySide directly) and use `_enum(QtCore.Q
 6. `pc.snapfit`, `pc.attach_floating`, `pc.flat_cut` / `pc.pillar_stand`, `pc.separate_colors`.
 7. `pc.analyze` + `_thin_features` give the report; `_write_group` writes 3MF (`pc.write_3mf`), OBJ or STL using `pc.part_output` (welded meshes). With `preview=1` the parts are mapped back to Angstrom (`Placement.inverse`, undoing the base's z shift) and loaded as CGO (`pc.mesh_cgo`) named `preview_*`; exports always skip `preview_*` objects.
 
+Printer checks: with `printer=` or `bed_x/y/z`, the report compares each group's size with the build volume and its colors with `slots`; `fit=1` replaces `size_mm` with the largest scale that fits (leaving room for a stand). In preview, `_printer_overlay_cgo` draws the build volume (`preview_printer`) and `pc.thin_mask` ray-casts inward from one triangle per grid cell to find walls thinner than `min_feature` (`preview_thin`, red, lifted 0.08 mm over the part).
+
+Supports: `pc.overhang_mask` / `pc.overhang_area` use the slicer convention (faces flatter than `support_angle` degrees from horizontal, not on the bed). `orient=min_support` scores 400 up directions with `pc.support_scores` (projected overhang area) and builds the rotation with `pc.frame_with_up`, keeping the screen's x axis. `helix_core=1` adds `_helix_cores` rods (axis from CA bisectors, radius sized to fuse with the ribbon) to the pieces before placement. `filaments=auto` uses `pc.pick_filaments` with `pc.FILAMENT_LIBRARY`.
+
+Fine PyMOL surfaces (`surface_quality` 1 and up) have a few seams where 3 or 4 triangles share an edge; `pc.repair_nonmanifold` cuts those spots out with a ring of neighbours and refills the holes, so the surface stays one closed solid.
+
 Nozzle and layer height (`nozzle`, `layer_height`) drive every option left at 0 ("auto"): thinnest feature, fit and socket clearances, pillar size, base sizes rounded to whole layers and rod facets (`pc.auto_segments`). New print-related options should follow the same pattern instead of hard-coding millimetres.
 
 Keep PyMOL calls in `print3d.py` and geometry in `print3d_core.py`, so the core stays testable without PyMOL.
@@ -104,7 +113,7 @@ Keep PyMOL calls in `print3d.py` and geometry in `print3d_core.py`, so the core 
 - Cartoon segments take the color of their CA atom unless `cartoon_color` is set.
 - `cmd.create` copies atom colors and representations, but not object-level settings. Copy them with `cmd.get_object_settings`.
 - Hex colors work as `0xRRGGBB`.
-- Struts are CGO objects. `print3d._struts_registry[name]` holds `dict(struts=[dict(p1, p2, m1, m2)], radius, color)`; `color=None` means each half takes its chain's color (`_chain_color_lookup`), recomputed whenever struts are drawn or exported.
+- Struts live in `print3d._struts_registry[name]` = `dict(struts=[dict(p1, p2, m1, m2, l1, l2)], radius, color, labels)`; `color=None` means each half takes its chain's color (`_chain_color_lookup`), recomputed whenever struts are drawn or exported. They are drawn by `_draw_struts` as a small molecule object (strut k = residue STR k of chain S, pseudo-atoms E1/E2 of element PS, one bond, flagged `ignore`), so they can be clicked, selected and labeled. Always change struts through the registry and redraw; never edit the object directly. Per-object exports build temporary CGO copies with `_strut_cgo`.
 
 ## manifold3d quirks
 

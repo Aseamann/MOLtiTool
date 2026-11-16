@@ -10,25 +10,28 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
 
 **Script Hub** (`script_hub.py`): a panel docked in PyMOL.
 - **Scripts tab:** lists every `.py` file in this folder together with the commands each one adds (found automatically, without running anything). Pick a command, fill in a form generated from its arguments and press Run. The exact command line appears in the PyMOL log. Drop a new script into the folder and press Refresh.
-- **3D Print tab:** the print3d tools below, with presets and a fold-out "About" note in every section.
+- **3D Print tab:** the print3d tools below, with presets, a fold-out "About" note in every section, a reset button beside every setting (plus **Defaults** for the whole tab) and a pop-up when an export is done.
 
 **print3d** (`print3d.py`, `print3d_core.py`): from PyMOL scene to print.
-- `printstyle`: thicker cartoon (helix, strand, loop) and sticks, in real Angstrom widths
-- `split_parts`: separate ligands (each glycan, say) or chains into their own objects, each surfaced on its own so nothing cuts into it
-- `struts`: support rods between residues close in space but far along the chain (same rules as ChimeraX `struts`), colored like their chain; `strut_add` / `strut_remove` edit single struts
+- `printstyle`: thicker cartoon (helix, strand, loop) and sticks, in real Angstrom widths; double and aromatic bonds as one full stick; optional solid-cylinder helices
+- `surfacestyle`: surface resolution (draft to maximum), probe radius, molecular or solvent-accessible surface, smoothed edges
+- `split_parts`: separate ligands (substrates, cofactors, inhibitors) or chains into their own objects, each surfaced on its own so nothing cuts into it
+- `struts`: support rods between residues close in space but far along the chain (same rules as ChimeraX `struts`), colored like their chain; click a strut to select and remove it, show ID labels, or add one between any two residues
 - `snapfit`: join two separately printed parts at their contact with a peg and walled socket, or magnet pockets, with a seat cut to shape and print clearance
 - `colorprint`: export with your colors
   - **3MF** opens ready to slice in OrcaSlicer, Anycubic Slicer Next and Bambu Studio, with every part already on its filament slot (and painted where colors mix)
   - **OBJ** with vertex colors, or **STL** per filament
   - sized to a longest side in mm, oriented the way you see it on screen
-  - colors snapped to the filaments you have loaded
+  - colors snapped to the filaments you have loaded, or `filaments=auto` (or `auto_filaments`) to pick common PLA colors closest to the scene
+  - **less support to pick out** (all optional): fill each helix with a core rod (`helix_core=1`), turn the model for the least overhang (`orient=min_support`), and paint the faces that will need support in the preview (`show_overhang=1`)
   - **single-color printer mode:** one file per color, smaller pieces plug into sockets in bigger ones
   - optional flat-cut bottom or a stand with pillars
   - tuned to your nozzle and layer height (thinnest feature, fit clearances, base sizes in whole layers)
-  - **Preview in PyMOL**: see the finished print (base, pegs, rods, colors) over your molecule before writing anything
+  - **printer profiles** for Anycubic (Kobra X, Kobra 3, Kobra S1, S1 Max, Kobra 3 Max), Bambu Lab (A1 mini, A1, A2L, P1S/P1P, X1 Carbon), Prusa (MINI+, MK4S, CORE One) and Creality (K1C, K2 Plus), or type your own build volume: the report says whether the model fits and whether it uses more colors than you have filament slots, and `fit=1` scales it to fill the printer
+  - **Preview in PyMOL**: see the finished print (base, pegs, rods, colors) over your molecule before writing anything, with the build volume drawn around it and anything thinner than your nozzle can print painted red
   - loose pieces (side chains that end just off the cartoon) joined with short rods
   - a report: size, grams of filament, parts thinner than your nozzle can handle, anything still floating, bed contact
-- `print3d_preset`: save and reuse whole setups by name
+- `print3d_preset`: save and reuse whole setups by name. Four are built in: **Multi-color Printer Cartoon**, **Single Color Printer Cartoon**, **Multi-color Printer Surface** and **Single Color Printer Surface**
 
 **Other PyMOL scripts**
 
@@ -60,7 +63,7 @@ The print3d commands are loaded together with the hub. To use them alone: `run /
 
 To add your own scripts to the hub, put them in this folder. Commands registered with `cmd.extend(...)` show up with a form for their arguments; scripts without commands get a **Run script** button.
 
-## Quick start: print a protein with a bound glycan
+## Quick start: print a protein with a bound ligand
 
 ```
 printstyle 3.0, 1.5, 3.0, 1.0, 1.25, 0.7
@@ -75,7 +78,7 @@ snapfit myprotein_polymer, myprotein_ligands, peg
 colorprint ~/Desktop/model.3mf, each=1, size_mm=120, filaments=cyan orange blue green, base=stand
 ```
 
-This writes `model_polymer.3mf` (protein, struts and stand) and `model_ligands.3mf` (glycan with a peg that clicks into the protein), and prints a report such as:
+This writes `model_polymer.3mf` (protein, struts and stand) and `model_ligands.3mf` (the ligand, with a peg that clicks into the protein), and prints a report such as:
 
 ```
 scale 3.32 mm per A, oriented as on screen
@@ -90,7 +93,9 @@ filaments: 1=cyan, 2=orange, 3=blue, 4=green
 Tips
 - Run `set cartoon_color, <color>` so cartoon segments don't take the color of their CA atom.
 - Parts that must fit together (and snap-fit connectors) need to be exported in one `colorprint` call with `each=1`.
-- Single-filament printer? Add `single_color=1` and print each file in its color, then glue.
+- Single-filament printer? Add `single_color=1` and print each file in its color, then glue. A surface prints in its main color.
+- Printing a surface instead? `surfacestyle all, 2` then `colorprint ~/Desktop/model.3mf, preset=Multi-color Printer Surface, printer=Bambu Lab A1, size_mm=100`.
+- `print3d_printers` lists the printer profiles; add `preview=1` to any `colorprint` to see it in the build volume first.
 - Every command has full help: `help colorprint`.
 
 ## Install (ChimeraX)

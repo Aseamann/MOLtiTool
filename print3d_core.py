@@ -327,6 +327,33 @@ def close_holes(va, ta, vc):
             np.vstack([vc, new_c]), len(new_v))
 
 
+def repair_nonmanifold(va, ta, vc, rounds=6):
+    """Fine PyMOL surfaces have a few seams where 3-4 triangles share an edge.
+    Cut those spots out (with one ring of neighbours) and fill the holes again.
+    Returns (va, ta, vc, number of spots fixed)."""
+    fixed = 0
+    for _ in range(rounds):
+        if len(ta) == 0:
+            break
+        e = np.sort(np.concatenate([ta[:, [0, 1]], ta[:, [1, 2]], ta[:, [2, 0]]]), axis=1)
+        u, cnt = np.unique(e, axis=0, return_counts=True)
+        bad = u[cnt > 2]
+        open_ = u[cnt == 1]
+        if len(bad) == 0 and len(open_) == 0:
+            break
+        seed = np.unique(np.concatenate([bad.ravel(), open_.ravel()]))
+        ring = np.unique(ta[np.isin(ta, seed).any(axis=1)])
+        keep = ~np.isin(ta, ring).any(axis=1)
+        fixed += len(bad)
+        ta = ta[keep]
+        used = np.unique(ta)
+        remap = -np.ones(len(va), np.int64)
+        remap[used] = np.arange(len(used))
+        va, vc, ta = va[used], vc[used], remap[ta]
+        va, ta, vc, _ = close_holes(va, ta, vc)
+    return va, ta, vc, fixed
+
+
 def is_watertight(ta):
     if len(ta) == 0:
         return False
@@ -450,6 +477,7 @@ def vrml_to_pieces(text, segments=24, round_ends=True, close_ends=True, notes=No
     prims, meshes = parse_vrml(text)
     if info is not None:
         info['radii'] = [(p['type'], p['radius']) for p in prims]
+        info['prims'] = prims
     pieces = []
     for p in prims:
         col = to_uint8(p['color'])
@@ -460,7 +488,7 @@ def vrml_to_pieces(text, segments=24, round_ends=True, close_ends=True, notes=No
             va, ta = capsule_mesh(p['center'] - half, p['center'] + half, p['radius'],
                                   segments, max(3, segments // 4), round_ends)
         pieces.append((va, ta, np.tile(col, (len(va), 1))))
-    capped = 0
+    capped = repaired = 0
     for va, ta, vc, vn in meshes:
         ta = orient_by_normals(va, ta, vn)
         va, ta, vc = weld_vertices(va, ta, to_uint8(vc))
@@ -468,12 +496,17 @@ def vrml_to_pieces(text, segments=24, round_ends=True, close_ends=True, notes=No
             if close_ends:
                 cva, cta, cvc, n = close_holes(cva, cta, cvc)
                 capped += n
+                if not is_watertight(cta):
+                    cva, cta, cvc, nf = repair_nonmanifold(cva, cta, cvc)
+                    repaired += nf
             pieces.append((cva, cta, cvc))
     nprim = len(prims)
     notes.append('Read %d sticks/spheres/struts and %d surface/cartoon pieces'
                  % (nprim, len(pieces) - nprim))
     if capped:
         notes.append('Capped %d open ends in cartoon/surface meshes' % capped)
+    if repaired:
+        notes.append('Repaired %d mesh seams in surfaces' % repaired)
     return pieces
 
 
@@ -1238,6 +1271,44 @@ def auto_segments(radius_mm, tol_mm, lo=12, hi=48):
     return max(lo, min(hi, n))
 
 
+def thin_mask(solid, va, ta, min_mm, max_rays=6000):
+    """Triangles of a printed part (mm) where the wall is thinner than min_mm.
+    Casts one inward ray per cell of an adaptive grid (at most max_rays) and
+    marks every triangle in a cell whose ray leaves the solid too soon."""
+    va = np.asarray(va, float)
+    ta = np.asarray(ta, np.int64)
+    out = np.zeros(len(ta), bool)
+    if solid is None or len(ta) == 0 or min_mm <= 0:
+        return out
+    v0, v1, v2 = va[ta[:, 0]], va[ta[:, 1]], va[ta[:, 2]]
+    cen = (v0 + v1 + v2) / 3.0
+    nrm = np.cross(v1 - v0, v2 - v0)
+    ln = np.linalg.norm(nrm, axis=1)
+    ok = ln > 1e-12
+    nrm[ok] /= ln[ok, None]
+    cell = max(min_mm * 0.75, 1e-3)
+    while True:
+        key = np.floor((cen - cen.min(0)) / cell).astype(np.int64)
+        _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+        if len(first) <= max_rays:
+            break
+        cell *= 1.4
+    inv = np.asarray(inv).ravel()
+    eps = min(0.02, 0.05 * min_mm)
+    thin_cell = np.zeros(len(first), bool)
+    for ci, ti in enumerate(first):
+        if not ok[ti]:
+            continue
+        d = -nrm[ti]
+        a = cen[ti] + d * eps
+        b = cen[ti] + d * (0.97 * min_mm)
+        for h in solid.ray_cast(tuple(map(float, a)), tuple(map(float, b))):
+            if float(np.dot(np.asarray(h.normal), d)) > 0:     # leaving the solid
+                thin_cell[ci] = True
+                break
+    return thin_cell[inv]
+
+
 def mesh_cgo(va, ta, tc):
     """PyMOL CGO triangle list (flat-shaded) for a preview of a printed part."""
     from pymol import cgo
@@ -1259,3 +1330,144 @@ def mesh_cgo(va, ta, tc):
         rec[:, 8 + 4 * k] = cgo.VERTEX
         rec[:, 9 + 4 * k:12 + 4 * k] = v
     return [cgo.BEGIN, cgo.TRIANGLES] + rec.ravel().tolist() + [cgo.END]
+
+
+# ---------------------------------------------------------------------------
+# supports: overhangs and orientation
+# ---------------------------------------------------------------------------
+
+def _tri_geom(va, ta):
+    va = np.asarray(va, float)
+    ta = np.asarray(ta, np.int64)
+    v0, v1, v2 = va[ta[:, 0]], va[ta[:, 1]], va[ta[:, 2]]
+    n = np.cross(v1 - v0, v2 - v0)
+    area2 = np.linalg.norm(n, axis=1)
+    ok = area2 > 1e-12
+    n[ok] /= area2[ok, None]
+    return n, 0.5 * area2, (v0 + v1 + v2) / 3.0
+
+
+def overhang_mask(va, ta, angle=30.0, floor=0.0, tol=0.2):
+    """Triangles (z up) a slicer would support: facing down more steeply than
+    `angle` degrees from horizontal, and not resting on the bed (z > floor+tol)."""
+    n, _, c = _tri_geom(va, ta)
+    return (-n[:, 2] > np.sin(np.radians(90.0 - float(angle)))) & (c[:, 2] > floor + tol)
+
+
+def overhang_area(va, ta, angle=30.0, floor=0.0, tol=0.2):
+    """Area (in the mesh's units squared) of the bed-projected overhangs."""
+    n, a, c = _tri_geom(va, ta)
+    m = (-n[:, 2] > np.sin(np.radians(90.0 - float(angle)))) & (c[:, 2] > floor + tol)
+    return float((a[m] * -n[m, 2]).sum())
+
+
+def sphere_directions(n=400):
+    """Evenly spread unit vectors (Fibonacci sphere)."""
+    i = np.arange(n) + 0.5
+    phi = np.arccos(1 - 2 * i / n)
+    th = np.pi * (1 + 5 ** 0.5) * i
+    return np.stack([np.cos(th) * np.sin(phi), np.sin(th) * np.sin(phi), np.cos(phi)], axis=1)
+
+
+def support_scores(pieces, ups, angle=30.0, tol=0.5):
+    """Projected overhang area for each candidate 'up' direction (model units)."""
+    ns, ars, cs, vs = [], [], [], []
+    for va, ta, _ in pieces:
+        if len(ta) == 0:
+            continue
+        n, a, c = _tri_geom(va, ta)
+        ns.append(n)
+        ars.append(a)
+        cs.append(c)
+        vs.append(np.asarray(va, float))
+    n, a, c = np.vstack(ns), np.concatenate(ars), np.vstack(cs)
+    V = np.vstack(vs)
+    if len(V) > 20000:
+        V = V[np.linspace(0, len(V) - 1, 20000).astype(int)]
+    lim = np.sin(np.radians(90.0 - float(angle)))
+    ups = np.asarray(ups, float)
+    out = np.zeros(len(ups))
+    for k in range(0, len(ups), 16):
+        U = ups[k:k + 16].T                    # (3, m)
+        nz = n @ U                             # (t, m)
+        h = c @ U - (V @ U).min(0)[None, :]
+        m = (-nz > lim) & (h > tol)
+        out[k:k + 16] = (a[:, None] * -nz * m).sum(0)
+    return out
+
+
+def frame_with_up(up, x_hint=None):
+    """Rotation R (x @ R) that maps `up` to +z, keeping x_hint as close to +x as possible."""
+    u = np.asarray(up, float)
+    u = u / np.linalg.norm(u)
+    x = np.array([1.0, 0, 0]) if x_hint is None else np.asarray(x_hint, float)
+    x = x - u * (x @ u)
+    if np.linalg.norm(x) < 1e-6:
+        x = np.array([0, 1.0, 0]) - u * u[1]
+    x /= np.linalg.norm(x)
+    y = np.cross(u, x)
+    return np.column_stack([x, y, u])
+
+
+def best_up(pieces, angle=30.0, n=400, tol=0.5, prefer=None):
+    """Direction (model frame) to point up for the least support. Returns
+    (up, area, scores, ups). `prefer` (an up vector) wins ties within 2 %."""
+    ups = sphere_directions(n)
+    if prefer is not None:
+        ups = np.vstack([np.asarray(prefer, float) / np.linalg.norm(prefer), ups])
+    sc = support_scores(pieces, ups, angle, tol)
+    k = int(np.argmin(sc))
+    if prefer is not None and sc[0] <= sc[k] * 1.02 + 1e-9:
+        k = 0
+    return ups[k], float(sc[k]), sc, ups
+
+
+# ---------------------------------------------------------------------------
+# filament auto-pick
+# ---------------------------------------------------------------------------
+
+# Typical PLA colors (approximate swatches), used to pick real filaments
+# closest to the colors in the scene.
+FILAMENT_LIBRARY = [
+    ('white', '#FFFFFF'), ('black', '#1A1A1A'), ('light gray', '#D1D3D5'),
+    ('gray', '#8E9089'), ('dark gray', '#545454'), ('silver', '#A6A9AA'),
+    ('red', '#C12E1F'), ('maroon', '#9D2235'), ('orange', '#FF6A13'),
+    ('pumpkin orange', '#FF9016'), ('yellow', '#F4EE2A'), ('sunflower yellow', '#FEC600'),
+    ('gold', '#E4BD68'), ('beige', '#F7E6DE'), ('brown', '#9D432C'),
+    ('cocoa brown', '#6F5034'), ('lime green', '#BECF00'), ('green', '#00AE42'),
+    ('dark green', '#3F8E43'), ('turquoise', '#00B1B7'), ('cyan', '#0086D6'),
+    ('sky blue', '#73C2FB'), ('cobalt blue', '#0056B8'), ('navy blue', '#0A2989'),
+    ('blue gray', '#5B6579'), ('purple', '#5E43B7'), ('indigo', '#482960'),
+    ('magenta', '#EC008C'), ('pink', '#F55A74'), ('light pink', '#F7B6C8'),
+]
+
+
+def _hex_rgb(h):
+    h = h.lstrip('#')
+    return np.array([int(h[i:i + 2], 16) for i in (0, 2, 4)], np.uint8)
+
+
+def pick_filaments(pieces, slots=4, library=None):
+    """Filaments from `library` [(name, '#RRGGBB')] closest to the scene's
+    colors, most-used first, at most `slots`. Returns [(name, hex, share)]."""
+    lib = FILAMENT_LIBRARY if library is None else library
+    lab_lib = _srgb_to_lab(np.array([_hex_rgb(h) for _, h in lib]))
+    cols, wts = [], []
+    for va, ta, vc in pieces:
+        if len(ta) == 0:
+            continue
+        _, a, _ = _tri_geom(va, ta)
+        tc = np.asarray(vc, np.uint8)[np.asarray(ta)[:, 0], :3]
+        cols.append(tc)
+        wts.append(a)
+    if not cols:
+        return []
+    C, W = np.vstack(cols), np.concatenate(wts)
+    uc, inv = np.unique(C, axis=0, return_inverse=True)
+    uw = np.bincount(np.asarray(inv).ravel(), weights=W, minlength=len(uc))
+    d = ((_srgb_to_lab(uc)[:, None, :] - lab_lib[None, :, :]) ** 2).sum(-1)
+    near = d.argmin(1)
+    tot = np.bincount(near, weights=uw, minlength=len(lib))
+    order = [int(i) for i in np.argsort(-tot) if tot[i] > 0][:max(1, int(slots))]
+    s = tot.sum() or 1.0
+    return [(lib[i][0], lib[i][1], float(tot[i] / s)) for i in order]

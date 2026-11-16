@@ -11,14 +11,37 @@ printstyle [helix_width, helix_thickness, strand_width, strand_thickness,
     Thicken cartoon and sticks. Full widths/thicknesses in Angstrom.
     Defaults: helix 3.0 x 1.5, strand 3.0 x 1.0, loops 1.25, sticks 0.7.
 
+surfacestyle [selection, quality, probe, solvent, smooth_edges, color, show]
+    Surface resolution (quality -1..4), probe radius, molecular or solvent-
+    accessible surface, smooth edges; shows the surface.
+
+print3d_printers
+    Printer profiles (build volume, filament slots) for colorprint printer=...
+
+auto_filaments [objects, slots]
+    Common PLA colors closest to the scene's colors (colorprint filaments=auto).
+
+ligand_surface [selection, name, color, quality, hide_source]
+    Shortcut: copy the ligand(s) into one object and surface it on its own.
+
 split_parts [selection, by, show, color, quality, prefix]
     Separate a structure into objects: by = ligands (polymer + each connected
-    ligand, e.g. each glycan), ligands_together, chains or objects; show =
+    ligand, e.g. each substrate or cofactor), ligands_together, chains or
+    objects; show =
     surface_ligands, surface or keep. Each part is surfaced on its own.
 
 struts [selection, length, loop, radius, color, name, replace]
     Support rods between atoms close in space but far apart along the chain
-    (same rules as ChimeraX "struts"). Default: name CA, 8, 60, 0.5.
+    (same rules as ChimeraX "struts"). Default: name CA, 8, 60, 0.5. Color
+    blank = each strut takes its chain's color (half and half between chains).
+strut_add atom1, atom2 [, name, radius, color]
+strut_remove atom1 [, atom2, name]
+    Add or remove one strut (an atom, or a residue = its CA). With only
+    atom1, strut_remove removes every strut at that atom.
+strut_remove_selected [selection]
+    Click a strut in the viewer (it is selected), then remove it with this.
+struts_label [on]
+    Show an ID label on every strut, e.g. "S3 A:LYS45-A:GLU112".
 
 snapfit host, guest [, kind, diameter, length, clearance, magnet_d, magnet_h, wall]
     Join two separately printed objects at their contact: the guest gets a
@@ -59,7 +82,7 @@ print3d_install_merge
     Install manifold3d into PyMOL's Python. Needed for merging, connectors,
     bases, single-color sockets and the full report.
 
-Example (protein + glycan, 4-color printer)
+Example (protein + bound ligand, 4-color printer)
     printstyle 3.0, 1.5, 3.0, 1.0, 1.25, 0.7
     color cyan, polymer
     set cartoon_color, cyan
@@ -83,8 +106,6 @@ from pymol import cmd, cgo
 # but the code object always knows the real path.
 import inspect as _inspect
 _HERE = os.path.dirname(os.path.abspath(_inspect.currentframe().f_code.co_filename))
-if not os.path.exists(os.path.join(_HERE, 'print3d_core.py')):
-    _HERE = os.path.expanduser('~/MOLtiTool')
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
@@ -120,18 +141,22 @@ def _msg(lines):
 
 def printstyle(helix_width=3.0, helix_thickness=1.5, strand_width=3.0,
                strand_thickness=1.0, loop_thickness=1.25, stick_radius=0.7,
-               sampling=14, hide_h=1, _self=cmd):
+               sampling=14, hide_h=1, cylinder_helices=0, helix_radius=2.25, _self=cmd):
     """
 DESCRIPTION
 
     Thicken cartoon and sticks for 3D printing. Sizes are full widths and
-    thicknesses in Angstroms.
+    thicknesses in Angstroms. Double and aromatic bonds are drawn as one
+    full-thickness stick (PyMOL's thin double-bond lines don't print).
 
 USAGE
 
     printstyle [helix_width [, helix_thickness [, strand_width [,
                strand_thickness [, loop_thickness [, stick_radius [,
-               sampling [, hide_h ]]]]]]]]
+               sampling [, hide_h [, cylinder_helices [, helix_radius ]]]]]]]]]]
+
+    cylinder_helices = 1: draw helices as solid cylinders (helix_radius A)
+             so no support material can get trapped inside them
     """
     s = _self
     s.set('cartoon_oval_length', _f(helix_width) / _HELIX_FACTOR)
@@ -142,12 +167,17 @@ USAGE
     s.set('stick_radius', _f(stick_radius))
     s.set('cartoon_sampling', int(float(sampling)))
     s.set('cartoon_fancy_helices', 0)
+    s.set('cartoon_cylindrical_helices', 1 if _b(cylinder_helices) else 0)
+    s.set('cartoon_helix_radius', _f(helix_radius))
+    _single_bonds(s)
     if _b(hide_h):
         s.hide('everything', 'hydro')
     s.rebuild()
     _msg(['cartoon helix %.2f x %.2f, strand %.2f x %.2f, loops %.2f, sticks radius %.2f A'
           % (_f(helix_width), _f(helix_thickness), _f(strand_width),
-             _f(strand_thickness), _f(loop_thickness), _f(stick_radius))])
+             _f(strand_thickness), _f(loop_thickness), _f(stick_radius))] +
+         (['helices as solid cylinders, radius %.2f A' % _f(helix_radius)]
+          if _b(cylinder_helices) else []))
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +185,19 @@ USAGE
 # ---------------------------------------------------------------------------
 
 def _bond_graph(selection, s):
-    """Adjacency over all atoms of the objects containing selection."""
+    """Adjacency over all atoms of the objects containing selection, plus a
+    short residue label per atom (e.g. 'A:LYS45')."""
     model = s.get_model('byobject (%s)' % selection)
     xyz = np.array([a.coord for a in model.atom], float)
     keys = [(a.model, a.index) for a in model.atom]
+    labels = ['%s:%s%s' % (a.chain, a.resn, a.resi) for a in model.atom]
     adj = [[] for _ in model.atom]
     for b in model.bond:
         i, j = b.index
         d = float(np.linalg.norm(xyz[i] - xyz[j]))
         adj[i].append((j, d))
         adj[j].append((i, d))
-    return keys, xyz, adj
+    return keys, xyz, adj, labels
 
 
 def _connections(sel_idx, adj, dmax):
@@ -274,14 +306,57 @@ def _strut_cgo(struts, radius, color, s=cmd):
     return obj
 
 
+def _strut_label(k, st):
+    return 'S%d %s-%s' % (k, st.get('l1', '?'), st.get('l2', '?'))
+
+
 def _draw_struts(name, s):
+    """Draw struts as a small molecule object: strut k is residue STR k of
+    chain S, two pseudo-atoms (E1, E2) joined by a stick. So clicking a strut
+    selects it (and PyMOL prints which one), and it can be labeled."""
+    from chempy import models, Atom, Bond
     entry = _struts_registry.get(name)
-    was_enabled = name not in s.get_names('objects') or name in s.get_names('objects', enabled_only=1)
+    was_enabled = name not in s.get_names('objects') or \
+        name in s.get_names('objects', enabled_only=1)
     s.delete(name)
-    if entry and entry['struts']:
-        s.load_cgo(_strut_cgo(entry['struts'], entry['radius'], entry['color'], s), name)
-        if not was_enabled:
-            s.disable(name)
+    if not entry or not entry['struts']:
+        return
+    color_of = _chain_color_lookup(s) if entry.get('color') is None else None
+    m = models.Indexed()
+    colors = []
+    for k, st in enumerate(entry['struts'], start=1):
+        for j, key in enumerate(('p1', 'p2')):
+            a = Atom()
+            a.name = 'E%d' % (j + 1)
+            a.resn = 'STR'
+            a.resi = str(k)
+            a.resi_number = k
+            a.chain = 'S'
+            a.symbol = 'PS'          # pseudo-atom: never counted as ligand/organic
+            a.hetatm = 1
+            a.coord = [float(x) for x in st[key]]
+            m.add_atom(a)
+            mdl = st['m1'] if j == 0 else st['m2']
+            colors.append(tuple(entry['color']) if color_of is None else color_of(mdl, st[key]))
+        b = Bond()
+        b.index = [2 * (k - 1), 2 * (k - 1) + 1]
+        b.order = 1
+        m.add_bond(b)
+    s.load_model(m, name)
+    s.hide('everything', name)
+    s.show('sticks', name)
+    s.set('stick_radius', float(entry['radius']), name)
+    s.flag('ignore', name, 'set')            # keep them out of surfaces
+    for i, c in enumerate(colors):
+        k, j = i // 2 + 1, i % 2 + 1
+        s.color('0x%02x%02x%02x' % tuple(int(round(v * 255)) for v in c),
+                '%s and resi %d and name E%d' % (name, k, j))
+    if entry.get('labels'):
+        s.set('label_size', 14, name)
+        for k, st in enumerate(entry['struts'], start=1):
+            s.label('%s and resi %d and name E1' % (name, k), repr(_strut_label(k, st)))
+    if not was_enabled:
+        s.disable(name)
 
 
 def _rgb_or_none(color, s):
@@ -318,7 +393,7 @@ SEE ALSO
     """
     s = _self
     length, loop, radius = _f(length), _f(loop), _f(radius)
-    keys, xyz, adj = _bond_graph(selection, s)
+    keys, xyz, adj, labels = _bond_graph(selection, s)
     key_index = {k: i for i, k in enumerate(keys)}
     sel_model = s.get_model(selection)
     sel_idx = [key_index[(a.model, a.index)] for a in sel_model.atom
@@ -357,14 +432,15 @@ SEE ALSO
             d = float(np.sqrt(d2))
             # remember which object each end belongs to (for per-object export)
             new.append(dict(p1=xyz[i1].copy(), p2=xyz[i2].copy(),
-                            m1=keys[i1][0], m2=keys[i2][0]))
+                            m1=keys[i1][0], m2=keys[i2][0], l1=labels[i1], l2=labels[i2]))
             sc.setdefault(i1, []).append((i2, d))
             sc.setdefault(i2, []).append((i1, d))
 
     _last['struts'] = dict(selection=selection, length=length, loop=loop, radius=radius,
                            color=color if isinstance(color, str) else '')
+    old_labels = _struts_registry.get(name, {}).get('labels', False)
     _struts_registry[name] = dict(struts=previous + new, radius=radius,
-                                  color=_rgb_or_none(color, s))
+                                  color=_rgb_or_none(color, s), labels=old_labels)
     _draw_struts(name, s)
     _msg(['created %d struts for "%s" (max length %.3g, loop %.3g), object "%s"%s'
           % (len(new), selection, length, loop, name,
@@ -385,7 +461,7 @@ def _one_atom(sel, s):
             raise ValueError('"%s" must be one atom or one residue (has %d atoms)'
                              % (sel, len(m.atom)))
     a = atoms[0]
-    return a.model, np.array(a.coord, float), '%s/%s/%s%s/%s' % (a.model, a.chain, a.resn, a.resi, a.name)
+    return a.model, np.array(a.coord, float), '%s:%s%s' % (a.chain, a.resn, a.resi)
 
 
 def strut_add(atom1, atom2, name='struts', radius=-1.0, color='', _self=cmd):
@@ -412,14 +488,15 @@ EXAMPLE
         return
     entry = _struts_registry.get(name)
     if entry is None:
-        entry = _struts_registry[name] = dict(struts=[], radius=0.5, color=None)
+        entry = _struts_registry[name] = dict(struts=[], radius=0.5, color=None, labels=False)
     if float(radius) > 0:
         entry['radius'] = float(radius)
     if str(color).strip():
         entry['color'] = _rgb_or_none(color, s)
-    entry['struts'].append(dict(p1=p1, p2=p2, m1=m1, m2=m2))
+    entry['struts'].append(dict(p1=p1, p2=p2, m1=m1, m2=m2, l1=l1, l2=l2))
     _draw_struts(name, s)
-    _msg(['strut added %s -- %s (%.1f A), object "%s"' % (l1, l2, np.linalg.norm(p1 - p2), name)])
+    _msg(['strut S%d added %s to %s (%.1f A), object "%s"'
+          % (len(entry['struts']), l1, l2, np.linalg.norm(p1 - p2), name)])
     return True
 
 
@@ -467,6 +544,60 @@ USAGE
     return removed
 
 
+def strut_remove_selected(selection='sele', _self=cmd):
+    """
+DESCRIPTION
+
+    Remove the struts that are in a selection. Click a strut in the viewer
+    (it selects that strut into (sele)), then run this.
+
+USAGE
+
+    strut_remove_selected [selection]
+    """
+    s = _self
+    from pymol import stored
+    removed = []
+    for nm, entry in list(_struts_registry.items()):
+        if nm not in s.get_names('objects'):
+            continue
+        stored._p3d = []
+        try:
+            s.iterate('(%s) and %s' % (selection, nm), 'stored._p3d.append(int(resv))')
+        except Exception:
+            continue
+        idx = sorted(set(stored._p3d), reverse=True)
+        for k in idx:
+            if 1 <= k <= len(entry['struts']):
+                removed.append(_strut_label(k, entry['struts'][k - 1]))
+                del entry['struts'][k - 1]
+        if idx:
+            _draw_struts(nm, s)
+    _msg(['removed %d strut(s)%s' % (len(removed), ': ' + ', '.join(removed) if removed else
+                                    ' (click a strut in the viewer to select it first)')])
+    return len(removed)
+
+
+def struts_label(on=1, name='', _self=cmd):
+    """
+DESCRIPTION
+
+    Show (on=1) or hide (on=0) an ID label on every strut, e.g.
+    "S3 A:LYS45-A:GLU112". Clicking a strut also prints its ID in the log
+    (S3 is residue STR 3 of the struts object).
+
+USAGE
+
+    struts_label [on [, name ]]
+    """
+    s = _self
+    for nm in ([name] if name else list(_struts_registry)):
+        if nm in _struts_registry:
+            _struts_registry[nm]['labels'] = _b(on)
+            _draw_struts(nm, s)
+    _msg(['strut labels %s' % ('on' if _b(on) else 'off')])
+
+
 def struts_delete(name='struts', _self=cmd):
     """
 DESCRIPTION
@@ -478,28 +609,29 @@ DESCRIPTION
 
 
 # ---------------------------------------------------------------------------
-# glycan surface
+# ligand surface
 # ---------------------------------------------------------------------------
 
-GLYCAN_DEFAULT = 'organic and not solvent'
+LIGAND_DEFAULT = 'organic and not solvent'
 
 
-def glycan_surface(selection=GLYCAN_DEFAULT, name='glycan_surf', color='green',
+def ligand_surface(selection=LIGAND_DEFAULT, name='ligand_surf', color='green',
                    quality=1, hide_source=1, _self=cmd):
     """
 DESCRIPTION
 
-    Copy selection (default: all non-polymer organic molecules, e.g. glycans)
+    Copy selection (default: all non-polymer organic molecules, e.g. a
+    substrate, cofactor or inhibitor)
     into its own object and show its surface alone, so it is not cut into by
     the protein surface.
 
 USAGE
 
-    glycan_surface [selection [, name [, color [, quality [, hide_source ]]]]]
+    ligand_surface [selection [, name [, color [, quality [, hide_source ]]]]]
     """
     s = _self
     if s.count_atoms(selection) == 0:
-        print(' glycan_surface: no atoms in "%s"' % selection)
+        print(' ligand_surface: no atoms in "%s"' % selection)
         return
     s.delete(name)
     s.create(name, selection)
@@ -534,7 +666,7 @@ def _copy_part(name, sel, src, s):
 
 def _ligand_groups(sel, s):
     """Connected groups of atoms in sel, using only bonds inside sel (so an
-    N-glycan bonded to Asn is still separated from the protein)."""
+    ligand covalently bonded to a residue is still separated from the protein)."""
     m = s.get_model(sel)
     n = len(m.atom)
     parent = list(range(n))
@@ -593,7 +725,7 @@ USAGE
 
 ARGUMENTS
 
-    by = ligands: polymer + one object per connected ligand (e.g. each glycan)
+    by = ligands: polymer + one object per connected ligand (e.g. each substrate)
          ligands_together: polymer + one object with all ligands
          chains: one object per chain
          objects: no copying; use the objects as they are
@@ -665,6 +797,122 @@ EXAMPLES
 
 
 # ---------------------------------------------------------------------------
+# printers, surfaces and built-in presets
+# ---------------------------------------------------------------------------
+
+# Build volumes (X, Y, Z in mm) from the manufacturers' specifications;
+# slots = filaments the stock multicolor unit holds (1 = single color).
+PRINTERS = {
+    'Anycubic Kobra X': dict(bed=(260, 260, 260), slots=4),
+    'Anycubic Kobra 3 / Kobra 3 Combo': dict(bed=(250, 250, 260), slots=4),
+    'Anycubic Kobra S1 / S1 Combo': dict(bed=(250, 250, 250), slots=4),
+    'Anycubic Kobra S1 Max': dict(bed=(350, 350, 350), slots=4),
+    'Anycubic Kobra 3 Max': dict(bed=(420, 420, 500), slots=4),
+    'Bambu Lab A1 mini': dict(bed=(180, 180, 180), slots=4),
+    'Bambu Lab A1': dict(bed=(256, 256, 256), slots=4),
+    'Bambu Lab A2L': dict(bed=(330, 320, 325), slots=4),
+    'Bambu Lab P1S / P1P': dict(bed=(256, 256, 256), slots=4),
+    'Bambu Lab X1 Carbon': dict(bed=(256, 256, 256), slots=4),
+    'Prusa MINI+': dict(bed=(180, 180, 180), slots=1),
+    'Prusa MK4S': dict(bed=(250, 210, 220), slots=1),
+    'Prusa CORE One': dict(bed=(250, 220, 270), slots=1),
+    'Creality K1C': dict(bed=(220, 220, 250), slots=1),
+    'Creality K2 Plus': dict(bed=(350, 350, 350), slots=4),
+}
+
+SURFACE_QUALITY = [(-1, 'Draft (fast, coarse)'), (0, 'Normal'), (1, 'Fine'),
+                   (2, 'Extra fine'), (3, 'Ultra fine'), (4, 'Maximum (slow, big files)')]
+
+
+def surfacestyle(selection='all', quality=1, probe=1.4, solvent=0, smooth_edges=1,
+                 color='', show=1, _self=cmd):
+    """
+DESCRIPTION
+
+    Set how surfaces are built, for printing. Applies to the objects in
+    selection, and shows their surface (show=1).
+
+USAGE
+
+    surfacestyle [selection [, quality [, probe [, solvent [, smooth_edges
+                 [, color [, show ]]]]]]]
+
+ARGUMENTS
+
+    quality = mesh resolution: -1 draft, 0 normal, 1 fine, 2 extra fine,
+              3 ultra fine, 4 maximum (finer = smoother print, bigger file)
+    probe = probe radius in A (1.4 = water; larger smooths out small pockets)
+    solvent = 0: molecular surface (follows the atoms), 1: solvent accessible
+              surface (inflated by the probe radius, chunkier)
+    smooth_edges = 1: smooth the edges where surface patches meet
+    color = optional surface color
+    """
+    s = _self
+    objs = [o for o in s.get_object_list('(%s)' % selection) if o not in _struts_registry]
+    if not objs:
+        print(' surfacestyle: no objects in "%s"' % selection)
+        return
+    for o in objs:
+        s.set('surface_quality', int(float(quality)), o)
+        s.set('solvent_radius', float(probe), o)
+        s.set('surface_solvent', int(_b(solvent)), o)
+        s.set('surface_smooth_edges', int(_b(smooth_edges)), o)
+        s.set('surface_type', 0, o)          # solid triangles (needed for printing)
+    if _b(show):
+        s.show('surface', '(%s) and not (%s)' % (selection, ' or '.join(_struts_registry) or 'none'))
+    if str(color).strip():
+        s.set('surface_color', color, ' or '.join(objs))
+    _last['surface'] = dict(selection=selection, quality=int(float(quality)), probe=float(probe),
+                            solvent=int(_b(solvent)), smooth_edges=int(_b(smooth_edges)),
+                            color=color)
+    label = dict(SURFACE_QUALITY).get(int(float(quality)), str(quality))
+    _msg(['surface: %s, probe %.2f A, %s, on %s' % (
+        label, float(probe), 'solvent accessible' if _b(solvent) else 'molecular', ', '.join(objs))])
+
+
+_CARTOON_STYLE = dict(helix_width=3.0, helix_thickness=1.5, strand_width=3.0,
+                      strand_thickness=1.0, loop_thickness=1.25, stick_radius=0.7,
+                      sampling=14, hide_h=1)
+_STRUTS = dict(selection='name CA', length=8.0, loop=60.0, radius=0.5, color='', name='struts')
+_SURFACE = dict(selection='all', quality=2, probe=1.4, solvent=0, smooth_edges=1, color='')
+
+BUILTIN_PRESETS = {
+    'Multi-color Printer Cartoon': dict(
+        style=dict(_CARTOON_STYLE), struts=dict(_STRUTS),
+        export=dict(format='3mf', single_color=0, base='stand', attach=1, union=1)),
+    'Single Color Printer Cartoon': dict(
+        style=dict(_CARTOON_STYLE), struts=dict(_STRUTS),
+        export=dict(format='stl', single_color=1, base='stand', attach=1, union=1)),
+    'Multi-color Printer Surface': dict(
+        surface=dict(_SURFACE),
+        export=dict(format='3mf', single_color=0, base='cut', base_depth=1.0, attach=1, union=1)),
+    'Single Color Printer Surface': dict(
+        surface=dict(_SURFACE),
+        export=dict(format='stl', single_color=1, base='cut', base_depth=1.0, attach=1, union=1)),
+}
+
+
+def _printer_overlay_cgo(bed, pl, zshift, s=cmd):
+    """Wire box of the build volume (+ a faint bed plate), in molecule space."""
+    bx, by, bz = [float(v) for v in bed]
+    c = np.array([[x, y, z] for z in (0, bz) for y in (-by / 2, by / 2) for x in (-bx / 2, bx / 2)])
+    A = pl.inverse(c - np.array([0.0, 0.0, zshift]))
+    edges = [(0, 1), (2, 3), (0, 2), (1, 3), (4, 5), (6, 7), (4, 6), (5, 7),
+             (0, 4), (1, 5), (2, 6), (3, 7)]
+    r = 0.6 / pl.scale                       # 0.6 mm thick edges
+    obj = []
+    for i, j in edges:
+        obj += [cgo.CYLINDER] + list(A[i]) + list(A[j]) + [r, 0.2, 0.5, 1.0, 0.2, 0.5, 1.0]
+    P = pl.inverse(c[:4] - np.array([0.0, 0.0, zshift + 0.5]))   # bed, 0.5 mm below the print
+    obj += [cgo.ALPHA, 0.2, cgo.BEGIN, cgo.TRIANGLES, cgo.COLOR, 0.6, 0.75, 1.0]
+    for t in ((0, 1, 3), (0, 3, 2)):
+        for k in t:
+            obj += [cgo.VERTEX] + list(P[k])
+    obj += [cgo.END, cgo.ALPHA, 1.0]
+    return obj
+
+
+# ---------------------------------------------------------------------------
 # export
 # ---------------------------------------------------------------------------
 
@@ -672,7 +920,9 @@ _connectors = []          # list of dict(host, guest, kind, ...)
 _last = {}                # last-used options per section (for presets)
 
 EXPORT_DEFAULTS = dict(objects='', format='3mf', each=0, size_mm=0.0, mm_per_A=1.0,
-                       nozzle=0.4, layer_height=0.2, preview=0,
+                       nozzle=0.4, layer_height=0.2, preview=0, printer='', bed_x=0.0,
+                       bed_y=0.0, bed_z=0.0, slots=0, fit=0, show_bed=1, show_thin=1,
+                       helix_core=0, support_angle=30.0, show_overhang=0,
                        orient='view', filaments='', base='none', base_depth=1.0,
                        pillars=3, pillar_d=0.0, min_feature=0.0, attach=1, attach_mm=4.0,
                        single_color=0, socket_clearance=0.0,
@@ -680,8 +930,110 @@ EXPORT_DEFAULTS = dict(objects='', format='3mf', each=0, size_mm=0.0, mm_per_A=1
                        round_ends=1, segments=0, color_tolerance=0)
 
 
+def _cartoon_rgb(s, obj, ca_rgb):
+    try:
+        cc = s.get('cartoon_color', obj)
+        if cc not in (None, '', 'default', '-1'):
+            return np.array([int(round(255 * x)) for x in s.get_color_tuple(cc)], np.uint8)
+    except Exception:
+        pass
+    return ca_rgb
+
+
+def _helix_cores(s, names, segments=12, overlap=0.4):
+    """Solid rods along the axis of every helix shown as cartoon, sized to fuse
+    with the ribbon, so no support can build up inside the helix.
+    Returns mesh pieces in Angstrom and the number of helices."""
+    pieces, nhel = [], 0
+    for obj in names:
+        if obj in _struts_registry or obj.startswith('preview_'):
+            continue
+        try:
+            if int(s.get('cartoon_cylindrical_helices', obj)):
+                continue                                  # already solid
+            thick = float(s.get('cartoon_oval_width', obj)) * _HELIX_FACTOR
+        except Exception:
+            continue
+        rows = []
+        s.iterate_state(-1, '(%s) and name CA and ss H and rep cartoon' % obj,
+                        'rows.append((segi, chain, int(resv), x, y, z, color))',
+                        space={'rows': rows, 'int': int})
+        runs, cur = [], []
+        for r in sorted(rows, key=lambda r: (r[0], r[1], r[2])):
+            if cur and (r[0], r[1]) == cur[-1][:2] and r[2] == cur[-1][2] + 1:
+                cur.append(r)
+            else:
+                if cur:
+                    runs.append(cur)
+                cur = [r]
+        if cur:
+            runs.append(cur)
+        for run in runs:
+            if len(run) < 5:
+                continue
+            ca = np.array([r[3:6] for r in run], float)
+            ax = []
+            for i in range(1, len(ca) - 1):
+                b = (ca[i - 1] - ca[i]) + (ca[i + 1] - ca[i])
+                nb = np.linalg.norm(b)
+                if nb > 1e-6:
+                    ax.append(ca[i] + 2.3 * b / nb)
+            if len(ax) < 3:
+                continue
+            ax = np.array(ax)
+            sm = ax.copy()
+            sm[1:-1] = (ax[:-2] + ax[1:-1] + ax[2:]) / 3.0
+            rad = np.median([np.min(np.linalg.norm(sm - c, axis=1)) for c in ca])
+            r_core = max(0.5, rad - thick / 2.0 + overlap)
+            d0 = sm[0] - sm[1]
+            d1 = sm[-1] - sm[-2]
+            pts = np.vstack([sm[0] + d0 / max(np.linalg.norm(d0), 1e-6) * 1.0, sm,
+                             sm[-1] + d1 / max(np.linalg.norm(d1), 1e-6) * 1.0])
+            col = _cartoon_rgb(s, obj, np.array([int(round(255 * x)) for x in
+                                                 s.get_color_tuple(run[len(run) // 2][6])], np.uint8))
+            for a, b in zip(pts[:-1], pts[1:]):
+                va, ta = pc.capsule_mesh(a, b, r_core, segments, max(3, segments // 4), True)
+                pieces.append((va, ta, np.tile(col, (len(va), 1))))
+            nhel += 1
+    return pieces, nhel
+
+
+def _single_bonds(s, objects=None):
+    """Draw double/aromatic bonds as one plain stick (valence off), globally and
+    on every object (or just `objects`). Returns what to pass to _restore_bonds."""
+    objs = s.get_names('objects') if objects is None else objects
+    old = {'': s.get('valence')}
+    for o in objs:
+        try:
+            old[o] = s.get('valence', o)
+            s.set('valence', 0, o)
+        except Exception:
+            pass
+    s.set('valence', 0)
+    return old
+
+
+def _restore_bonds(s, old):
+    for o, v in old.items():
+        try:
+            if o:
+                s.set('valence', v, o)
+        except Exception:
+            pass
+    s.set('valence', old.get('', 'on'))
+
+
 def _scene_vrml(s):
-    """VRML of everything shown, in model coordinates (independent of view)."""
+    """VRML of everything shown, in model coordinates (independent of view).
+    Bond orders are flattened so double/aromatic bonds export as one full stick."""
+    bonds = _single_bonds(s, s.get_names('objects', enabled_only=1))
+    try:
+        return _scene_vrml_raw(s)
+    finally:
+        _restore_bonds(s, bonds)
+
+
+def _scene_vrml_raw(s):
     view = s.get_view()
     try:
         ext = np.array(s.get_extent('enabled'), float)
@@ -863,7 +1215,9 @@ def _write_group(parts, fmt, path_stem, ext, label, slot_of, palette_names, line
 
 
 def colorprint(filename, objects='', format='', each=-1, size_mm=-1.0, mm_per_A=-1.0,
-               nozzle=-1.0, layer_height=-1.0, preview=-1,
+               nozzle=-1.0, layer_height=-1.0, preview=-1, printer='', bed_x=-1.0,
+               bed_y=-1.0, bed_z=-1.0, slots=-1, fit=-1, show_bed=-1, show_thin=-1,
+               helix_core=-1, support_angle=-1.0, show_overhang=-1,
                orient='', filaments=None, base='', base_depth=-1.0, pillars=-1,
                pillar_d=-1.0, min_feature=-1.0, attach=-1, attach_mm=-1.0,
                single_color=-1, socket_clearance=-1.0, union=-1,
@@ -887,15 +1241,28 @@ ARGUMENTS
              colors) or stl (one file per filament). Default: 3mf
     each = 1: one file per object (struts go with the object they brace)
     size_mm = longest side in mm (overrides mm_per_A); mm_per_A default 1
-    orient = view: printed the way you see it (screen-down = bed) | model
+    orient = view: printed the way you see it (screen-down = bed) | model |
+             min_support: turned to need the least support material
     filaments = colors loaded in slots 1, 2, 3... e.g. "cyan orange blue green";
-                every color is snapped to the closest filament
+                every color is snapped to the closest filament.
+                filaments=auto picks common PLA colors closest to the scene
+                (as many as the printer's filament slots, default 4)
+    helix_core = 1: fill each cartoon helix with a solid rod along its axis, so
+             no support builds up inside it
+    support_angle = overhangs flatter than this (degrees from horizontal) need
+             support, as in the slicer (default 30)
+    show_overhang = 1: in preview, paint faces that will need support magenta
     base = none | cut (flat bottom, base_depth mm) | stand (plate + pillars)
     nozzle, layer_height = what to optimize for (default 0.4 / 0.2 mm). They
              set the defaults below whenever those are 0 (= auto): thinnest
              feature 3.75 x nozzle, fit clearance nozzle/2, socket clearance
              0.4 x nozzle, pillar thickness 7.5 x nozzle (>= 3 mm), base sizes in
              whole layers and rod smoothness within half a layer
+    printer = a profile name from print3d_printers (sets the build volume and
+             filament slots), or give bed_x, bed_y, bed_z (mm) and slots yourself
+    fit = 1: scale the model to fill the build volume (overrides size_mm)
+    show_bed, show_thin = in preview: draw the build volume, and highlight in
+             red any rods thinner than the printer can make (default on)
     preview = 1: build everything but load it into PyMOL as objects named
              preview_<name> (in place over the molecule) instead of writing files
     min_feature = warn below this thickness in mm (0 = auto)
@@ -909,9 +1276,12 @@ ARGUMENTS
     s = _self
     opts = dict(EXPORT_DEFAULTS)
     if preset:
-        opts.update(_load_presets().get(str(preset), {}).get('export', {}))
+        opts.update(all_presets().get(str(preset), {}).get('export', {}))
     given = dict(objects=objects, format=format, each=each, size_mm=size_mm, mm_per_A=mm_per_A,
-                 nozzle=nozzle, layer_height=layer_height, preview=preview,
+                 nozzle=nozzle, layer_height=layer_height, preview=preview, printer=printer,
+                 bed_x=bed_x, bed_y=bed_y, bed_z=bed_z, slots=slots, fit=fit,
+                 show_bed=show_bed, show_thin=show_thin, helix_core=helix_core,
+                 support_angle=support_angle, show_overhang=show_overhang,
                  orient=orient, filaments=filaments, base=base, base_depth=base_depth,
                  pillars=pillars, pillar_d=pillar_d, min_feature=min_feature, attach=attach,
                  attach_mm=attach_mm, single_color=single_color,
@@ -955,6 +1325,17 @@ ARGUMENTS
     base_depth = layers(o['base_depth'], 2)
     plate_t = layers(max(2.0, 8 * lh), 4)
     stand_gap = layers(4.0)
+
+    prof = PRINTERS.get(str(o['printer']).strip()) if str(o['printer']).strip() else None
+    if str(o['printer']).strip() and prof is None:
+        print(' colorprint: unknown printer "%s" (see print3d_printers)' % o['printer'])
+    bed = None
+    if float(o['bed_x']) > 0 and float(o['bed_y']) > 0 and float(o['bed_z']) > 0:
+        bed = (float(o['bed_x']), float(o['bed_y']), float(o['bed_z']))
+    elif prof:
+        bed = prof['bed']
+    slots = int(float(o['slots'])) or (prof['slots'] if prof else 0)
+    fit = _b(o['fit']) and bed is not None
     names = str(o['objects']).replace(',', ' ').split()
     missing = [n for n in names if n not in s.get_names('all')]
     if missing:
@@ -998,10 +1379,17 @@ ARGUMENTS
             notes, info = [], {}
             pieces = pc.vrml_to_pieces(vr, seg, _b(o['round_ends']), _b(o['close_ends']),
                                        notes, info)
+            gn = gnames or [n for n in s.get_names('objects', enabled_only=1)
+                            if not n.startswith('preview_')]
+            if pieces and _b(o['helix_core']):
+                cores, nh = _helix_cores(s, gn, max(8, seg))
+                pieces += cores
+                if nh:
+                    notes.append('filled %d helices with a solid core' % nh)
             if pieces:
-                out.append(dict(label=label, names=gnames or [
-                    n for n in s.get_names('objects', enabled_only=1) if not n.startswith('preview_')],
-                                pieces=pieces, radii=info.get('radii', []), notes=notes))
+                out.append(dict(label=label, names=gn,
+                                pieces=pieces, radii=info.get('radii', []),
+                                prims=info.get('prims', []), notes=notes))
         return out
     raw = tessellate(segments or 12)
     if not raw:
@@ -1009,9 +1397,26 @@ ARGUMENTS
         return
 
     # ---- shared placement so separately printed parts still match ----
-    rot = pc.view_rotation(s.get_view()) if str(o['orient']).lower() == 'view' else None
+    omode = str(o['orient']).lower()
+    sangle = float(o['support_angle'])
+    rot = pc.view_rotation(s.get_view()) if omode in ('view', 'min_support', 'support') else None
+    if omode in ('min_support', 'support'):
+        allp = [pc_ for g in raw for pc_ in g['pieces']]
+        view_up = rot[:, 2]
+        up, area_best, _, _ = pc.best_up(allp, sangle, prefer=view_up)
+        area_view = pc.support_scores(allp, [view_up], sangle)[0]
+        rot = pc.frame_with_up(up, rot[:, 0])
+        notes_all.append('turned for the least support: overhangs %.0f A2 (as on screen: %.0f A2)'
+                         % (area_best, area_view))
     allpts = np.vstack([va for g in raw for va, _, _ in g['pieces']])
-    pl = pc.make_placement(allpts, rot, mm_per_A, size_mm)
+    if fit:
+        Rm = np.eye(3) if rot is None else rot
+        ext = np.ptp(allpts @ Rm, axis=0)
+        room_z = bed[2] - (stand_gap + plate_t if str(o['base']).lower() == 'stand' else 0)
+        sc = min(0.95 * bed[0] / ext[0], 0.95 * bed[1] / ext[1], 0.97 * room_z / ext[2])
+        pl = pc.make_placement(allpts, rot, sc, 0)
+    else:
+        pl = pc.make_placement(allpts, rot, mm_per_A, size_mm)
     if not segments:      # auto: facets within half a layer of the true rod surface
         radii = [r for g in raw for _, r in g['radii']]
         if radii:
@@ -1020,7 +1425,15 @@ ARGUMENTS
                 raw = tessellate(segments)
 
     # ---- filament palette ----
+    picked = []
+    if str(o['filaments']).strip().lower() == 'auto':
+        picked = pc.pick_filaments([pc_ for g in raw for pc_ in g['pieces']], slots or 4)
+        o = dict(o, filaments=' '.join(h for _, h, _ in picked))
+        notes_all.append('filaments picked from the scene: ' + ', '.join(
+            '%d=%s (%s)' % (i + 1, n, h) for i, (n, h, _) in enumerate(picked)))
     pal = _parse_colors(o['filaments'], s) if o['filaments'] else []
+    if picked and pal:
+        pal = [(picked[i][0] if i < len(picked) else nm, c) for i, (nm, c) in enumerate(pal)]
     pal_rgb = np.array([c for _, c in pal], np.uint8) if pal else None
     orig_map = []
     if pal_rgb is not None:
@@ -1112,6 +1525,10 @@ ARGUMENTS
     out_files, report = [], []
     report.append('scale %.2f mm per A, %s' % (pl.scale, 'oriented as on screen'
                                                 if rot is not None else 'molecule frame'))
+    if bed:
+        report.append('printer: %s, build volume %d x %d x %d mm%s%s' % (
+            o['printer'] or 'custom', bed[0], bed[1], bed[2],
+            ', %d filament slots' % slots if slots else '', ', scaled to fit' if fit else ''))
     report.append('tuned for %.2f mm nozzle, %.2f mm layers: thinnest feature %.2f mm, fit '
                   'clearance %.2f mm, socket clearance %.2f mm, %d facets per rod'
                   % (nz, lh, min_feature, fit_c, socket_c, segments))
@@ -1119,6 +1536,7 @@ ARGUMENTS
         report.append('filaments: ' + ', '.join('%d=%s' % (i + 1, n) for i, (n, _) in enumerate(pal)))
         report.append('   colors mapped: ' + ', '.join(
             '#%s->%d' % (pc.hex_color(c), sl + 1) for c, sl in orig_map))
+    thin_cgo, thin_tris, over_cgo = [], 0, []
     for g in raw:
         parts = g['parts']
         near = _near_atom(s, g['names'], pl)
@@ -1130,6 +1548,24 @@ ARGUMENTS
         if a.get('grams'):
             head += ', about %.0f g if printed solid' % a['grams']
         report.append(head)
+        if bed and a.get('size') is not None:
+            sz = np.asarray(a['size'], float)
+            over = [('XYZ'[i], sz[i], bed[i]) for i in range(3) if sz[i] > bed[i] + 1e-6]
+            if not over:
+                report.append('   fits the build volume')
+            elif all(np.sort(sz) <= np.sort(bed) + 1e-6):
+                report.append('   too big as oriented (%s), but fits if rotated in the slicer'
+                              % ', '.join('%s %.0f > %.0f mm' % t for t in over))
+            else:
+                report.append('   DOES NOT FIT: %s; lower the size, use fit=1, or split it'
+                              % ', '.join('%s %.0f > %.0f mm' % t for t in over))
+        if slots and not single:
+            used = {tuple(int(round(float(x) * (255 if max(p.color) <= 1 else 1))) for x in p.color[:3])
+                    for p in parts}
+            if len(used) > slots:
+                report.append('   uses %d colors but the printer has %d filament slot%s: set '
+                              'the filaments to snap colors, recolor, or use single_color=1'
+                              % (len(used), slots, '' if slots == 1 else 's'))
         per = []
         for p in parts:
             if p.solid is not None:
@@ -1138,6 +1574,15 @@ ARGUMENTS
                     slot_of(p.color), p.volume() / 1000 * pc.PLA_DENSITY))
         if per:
             report.append('   ' + '; '.join(per))
+        ov = 0.0
+        for prt in parts:
+            va_, ta_, _ = pc.part_output(prt)
+            if len(ta_):
+                ov += pc.overhang_area(va_, ta_, sangle, 0.0, lh)
+        if ov > 1.0:
+            report.append('   needs support under about %.1f cm2 (overhangs flatter than %.0f deg)%s'
+                          % (ov / 100.0, sangle, '' if omode in ('min_support', 'support') else
+                             '; orient=min_support may need less'))
         for w in _thin_features(s, g['names'], g['radii'], pl.scale, min_feature):
             report.append('   thin: ' + w)
         bodies = a.get('bodies') or []
@@ -1155,6 +1600,27 @@ ARGUMENTS
             cg = []
             for prt in parts:
                 va, ta, tc = pc.part_output(prt)
+                if _b(o['show_thin']) and prt.solid is not None:
+                    tm = pc.thin_mask(prt.solid, va, ta, min_feature)
+                    if tm.any():
+                        thin_tris += int(tm.sum())
+                        tri = va[ta[tm]]                       # (k, 3, 3), mm
+                        nn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+                        nn /= np.maximum(np.linalg.norm(nn, axis=1), 1e-12)[:, None]
+                        tri = (tri + 0.08 * nn[:, None, :]).reshape(-1, 3)   # lift over the part
+                        tv = pl.inverse(tri - np.array([0.0, 0.0, g.get('zshift', 0.0)]))
+                        thin_cgo += pc.mesh_cgo(tv, np.arange(len(tv)).reshape(-1, 3),
+                                                np.tile([235, 25, 25], (int(tm.sum()), 1)))
+                if _b(o['show_overhang']) and len(ta):
+                    om = pc.overhang_mask(va, ta, sangle, 0.0, lh)
+                    if om.any():
+                        tri = va[ta[om]]
+                        nn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+                        nn /= np.maximum(np.linalg.norm(nn, axis=1), 1e-12)[:, None]
+                        tri = (tri + 0.06 * nn[:, None, :]).reshape(-1, 3)
+                        tv = pl.inverse(tri - np.array([0.0, 0.0, g.get('zshift', 0.0)]))
+                        over_cgo += pc.mesh_cgo(tv, np.arange(len(tv)).reshape(-1, 3),
+                                                np.tile([225, 40, 200], (int(om.sum()), 1)))
                 va = pl.inverse(va - np.array([0.0, 0.0, g.get('zshift', 0.0)]))
                 cg += pc.mesh_cgo(va, ta, tc)
             pname = 'preview_' + _safe(g['label'])
@@ -1184,6 +1650,26 @@ ARGUMENTS
                                       pal_names, report)
     report += notes_all
     if preview:
+        s.delete('preview_printer')
+        s.delete('preview_thin')
+        s.delete('preview_overhang')
+        if over_cgo:
+            s.load_cgo(over_cgo, 'preview_overhang')
+            out_files.append('preview_overhang')
+            report.append('magenta in preview_overhang = faces the slicer will support '
+                          '(flatter than %.0f deg)' % sangle)
+        if bed and _b(o['show_bed']):
+            s.load_cgo(_printer_overlay_cgo(bed, pl, main.get('zshift', 0.0), s), 'preview_printer')
+            out_files.append('preview_printer')
+        if _b(o['show_thin']):
+            if thin_cgo:
+                s.load_cgo(thin_cgo, 'preview_thin')
+                s.set('cgo_transparency', 0.0, 'preview_thin')
+                out_files.append('preview_thin')
+                report.append('red in preview_thin = walls or rods thinner than %.2f mm '
+                              '(thicken them or scale up)' % min_feature)
+            else:
+                report.append('nothing thinner than %.2f mm' % min_feature)
         report.append('preview loaded: %s (nothing written; hide with: disable preview_*, '
                       'remove with: delete preview_*)' % ', '.join(out_files))
         _msg(report)
@@ -1206,7 +1692,7 @@ def snapfit(host, guest, kind='peg', diameter=4.0, length=6.0, clearance=0.0,
     """
 DESCRIPTION
 
-    Join two separately printed objects (e.g. protein and glycan) at their
+    Join two separately printed objects (e.g. protein and ligand) at their
     contact: the guest gets a seat cut to the host's shape, plus either a peg
     (host gets a socket) or magnet pockets in both. Applied by
     "colorprint ..., each=1". Sizes in mm (after scaling).
@@ -1261,6 +1747,13 @@ def _load_presets():
         return {}
 
 
+def all_presets():
+    """Built-in presets plus the user's own (user names win)."""
+    data = {k: {sk: dict(sv) for sk, sv in v.items()} for k, v in BUILTIN_PRESETS.items()}
+    data.update(_load_presets())
+    return data
+
+
 def _save_presets(data):
     import json
     os.makedirs(os.path.dirname(PRESET_FILE), exist_ok=True)
@@ -1278,7 +1771,7 @@ def current_settings(s=cmd):
                  stick_radius=float(s.get('stick_radius')),
                  sampling=int(float(s.get('cartoon_sampling'))))
     data = dict(style={k: round(v, 3) for k, v in style.items()})
-    for k in ('struts', 'split', 'export', 'snapfit'):
+    for k in ('struts', 'split', 'export', 'snapfit', 'surface'):
         if k in _last:
             data[k] = dict(_last[k])
     return data
@@ -1288,43 +1781,90 @@ def print3d_preset(action='list', name='', _self=cmd):
     """
 DESCRIPTION
 
-    Save, load, list or delete named print presets (thickness, struts,
-    split, export and snap-fit options), stored in print3d_presets.json.
+    Save, load, list or delete named print presets (thickness, surface,
+    struts, split, export and snap-fit options), stored in
+    print3d_presets.json. Built-in presets: "Multi-color Printer Cartoon",
+    "Single Color Printer Cartoon", "Multi-color Printer Surface",
+    "Single Color Printer Surface" (can be loaded, not overwritten).
 
 USAGE
 
     print3d_preset list
     print3d_preset save, DN3      # current thickness + last-used options
-    print3d_preset load, DN3      # applies thickness; export options are
-                                  # used by: colorprint file, preset=DN3
+    print3d_preset load, DN3      # applies thickness / surface settings;
+                                  # export options are used by:
+                                  # colorprint file, preset=DN3
     print3d_preset delete, DN3
     """
     s = _self
-    action, name = str(action).lower(), str(name)
+    action, name = str(action).lower(), str(name).strip()
     data = _load_presets()
     if action == 'list':
-        _msg(['presets: ' + (', '.join(sorted(data)) or '(none)')])
-        return sorted(data)
+        _msg(['built-in: ' + ', '.join(BUILTIN_PRESETS),
+              'yours: ' + (', '.join(sorted(data)) or '(none)')])
+        return list(BUILTIN_PRESETS) + sorted(data)
     if not name:
         print(' print3d_preset: give a name')
+        return
+    if action in ('save', 'delete') and name in BUILTIN_PRESETS:
+        print(' print3d_preset: "%s" is built in; use another name' % name)
         return
     if action == 'save':
         data[name] = current_settings(s)
         _save_presets(data)
         _msg(['saved preset "%s" to %s' % (name, PRESET_FILE)])
     elif action == 'load':
-        p = data.get(name)
+        p = all_presets().get(name)
         if p is None:
             print(' print3d_preset: no preset "%s"' % name)
             return
         if 'style' in p:
             printstyle(_self=s, **p['style'])
+        if 'surface' in p:
+            surfacestyle(_self=s, **p['surface'])
         _msg(['loaded preset "%s"' % name])
         return p
     elif action == 'delete':
         if data.pop(name, None) is not None:
             _save_presets(data)
             _msg(['deleted preset "%s"' % name])
+
+
+def auto_filaments(objects='', slots=4, _self=cmd):
+    """
+DESCRIPTION
+
+    Suggest filaments: the common PLA colors closest to the colors shown,
+    most used first, at most `slots`. Use the result as colorprint filaments=
+    (or just pass filaments=auto to colorprint).
+
+USAGE
+
+    auto_filaments [objects [, slots ]]
+    """
+    s = _self
+    names = [n for n in str(objects).replace(',', ' ').split() if n]
+    vr = _vrml_of(s, names)
+    pieces = pc.vrml_to_pieces(vr, 8, True, True, [], {})
+    picked = pc.pick_filaments(pieces, int(float(slots)) or 4)
+    _msg(['filaments: ' + ', '.join('%d=%s (%s, %.0f%%)' % (i + 1, n, h, 100 * w)
+                                    for i, (n, h, w) in enumerate(picked)),
+          'use: colorprint file, filaments=' + ' '.join('0x' + h.lstrip('#').lower()
+                                                        for _, h, _ in picked)])
+    return picked
+
+
+def print3d_printers(_self=cmd):
+    """
+DESCRIPTION
+
+    List the printer profiles (build volume, filament slots) usable with
+    colorprint ..., printer=NAME.
+    """
+    for n, d in PRINTERS.items():
+        print(' %-34s %d x %d x %d mm, %d slot%s' % ((n,) + tuple(d['bed']) +
+                                                    (d['slots'], '' if d['slots'] == 1 else 's')))
+    return list(PRINTERS)
 
 
 def print3d_install_merge(_self=cmd):
@@ -1356,8 +1896,13 @@ cmd.extend('struts', struts)
 cmd.extend('struts_delete', struts_delete)
 cmd.extend('strut_add', strut_add)
 cmd.extend('strut_remove', strut_remove)
-cmd.extend('glycan_surface', glycan_surface)
+cmd.extend('strut_remove_selected', strut_remove_selected)
+cmd.extend('struts_label', struts_label)
+cmd.extend('ligand_surface', ligand_surface)
 cmd.extend('split_parts', split_parts)
+cmd.extend('surfacestyle', surfacestyle)
+cmd.extend('print3d_printers', print3d_printers)
+cmd.extend('auto_filaments', auto_filaments)
 cmd.extend('colorprint', colorprint)
 cmd.extend('snapfit', snapfit)
 cmd.extend('snapfit_clear', snapfit_clear)
@@ -1368,7 +1913,8 @@ cmd.auto_arg[0]['strut_add'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[1]['strut_add'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[0]['strut_remove'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[1]['strut_remove'] = cmd.auto_arg[0]['zoom']
-cmd.auto_arg[0]['glycan_surface'] = cmd.auto_arg[0]['zoom']
+cmd.auto_arg[0]['ligand_surface'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[0]['split_parts'] = cmd.auto_arg[0]['zoom']
+cmd.auto_arg[0]['surfacestyle'] = cmd.auto_arg[0]['zoom']
 cmd.auto_arg[0]['snapfit'] = cmd.auto_arg[0]['disable']
 cmd.auto_arg[1]['snapfit'] = cmd.auto_arg[0]['disable']
