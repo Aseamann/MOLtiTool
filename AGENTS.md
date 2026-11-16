@@ -6,12 +6,16 @@ Guide for AI coding agents (and humans) adding tools to this repo. Read this bef
 
 ```
 script_hub.py      Script Hub panel (PyMOL Qt dock): "3D Print" tab + "Scripts" tab
-print3d.py         PyMOL commands for 3D printing (thin layer that talks to PyMOL)
-print3d_core.py    geometry engine, pure numpy (+ optional manifold3d), no PyMOL imports
+3d_printing/
+  print3d.py       PyMOL commands for 3D printing (thin layer that talks to PyMOL)
+  print3d_core.py  geometry engine, pure numpy (+ optional manifold3d), no PyMOL imports
+  print3d_presets.json  user presets (created on first save, git-ignored)
 *.py (others)      standalone tools; each registers commands with cmd.extend
 chimerax/          ChimeraX tools (separate from the PyMOL hub)
 docs/images/       README images
 ```
+
+`script_hub.py` puts `3d_printing/` first on `sys.path` before `import print3d`; `print3d.py` adds its own folder too, so `run 3d_printing/print3d.py` also works alone. The Scripts tab lists only top-level `.py` files, so put new standalone tools in the root (or give a new subfolder its own tab).
 
 Files listed in `.gitignore` (personal scripts, structures, presets, exports) stay local. Never add or un-ignore them.
 

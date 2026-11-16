@@ -4,7 +4,7 @@ script_hub.py  -  MOLtiTool: a PyMOL panel for the scripts in this folder.
 Tabs
   3D Print : thicken cartoon/sticks, add struts, separate ligands/chains
              (each surfaced alone), export colored OBJ / per-color STL files,
-             optionally one file per part (uses print3d.py).
+             optionally one file per part (uses 3d_printing/print3d.py).
   Scripts  : every .py in the folder, with the commands each one adds
              (found automatically). Pick a command, fill in its arguments,
              press Run. New scripts appear after "Refresh".
@@ -30,6 +30,13 @@ from pymol import cmd
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(inspect.currentframe().f_code.co_filename))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
+
+# the 3D printing tools live in their own subfolder
+PRINT3D_DIR = os.path.join(SCRIPTS_DIR, '3d_printing')
+if os.path.isdir(PRINT3D_DIR):
+    if PRINT3D_DIR in sys.path:
+        sys.path.remove(PRINT3D_DIR)
+    sys.path.insert(0, PRINT3D_DIR)
 
 # files that are part of the hub itself, not user scripts
 _HIDDEN = {'script_hub.py', 'print3d_core.py'}

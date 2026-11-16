@@ -12,7 +12,7 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
 - **Scripts tab:** lists every `.py` file in this folder together with the commands each one adds (found automatically, without running anything). Pick a command, fill in a form generated from its arguments and press Run. The exact command line appears in the PyMOL log. Drop a new script into the folder and press Refresh.
 - **3D Print tab:** the print3d tools below, with presets, a fold-out "About" note in every section, a reset button beside every setting (plus **Defaults** for the whole tab) and a pop-up when an export is done.
 
-**print3d** (`print3d.py`, `print3d_core.py`): from PyMOL scene to print.
+**print3d** (`3d_printing/print3d.py`, `3d_printing/print3d_core.py`): from PyMOL scene to print.
 - `printstyle`: thicker cartoon (helix, strand, loop) and sticks, in real Angstrom widths; double and aromatic bonds as one full stick; optional solid-cylinder helices
 - `surfacestyle`: surface resolution (draft to maximum), probe radius, molecular or solvent-accessible surface, smoothed edges
 - `split_parts`: separate ligands (substrates, cofactors, inhibitors) or chains into their own objects, each surfaced on its own so nothing cuts into it
@@ -57,7 +57,7 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
    ```
 3. Restart PyMOL and open **Plugin > Script Hub**, or type `script_hub`.
 
-The print3d commands are loaded together with the hub. To use them alone: `run /path/to/MOLtiTool/print3d.py`.
+The print3d commands are loaded together with the hub. To use them alone: `run /path/to/MOLtiTool/3d_printing/print3d.py`.
 
 **Optional, recommended:** merging solids, snap-fit connectors, bases, single-color sockets and the full printability report use [manifold3d](https://github.com/elalish/manifold). Click **Install merge library** in the panel, or type `print3d_install_merge`. Without it, exports still work (capped pieces instead of merged solids).
 
@@ -114,7 +114,7 @@ For merged solids run `pip install manifold3d` in the ChimeraX command line once
 
 ## How this was made
 
-Fair warning: a good part of this repo was vibe-coded with [Claude](https://claude.ai). That includes Script Hub (`script_hub.py`), the 3D-printing tools (`print3d.py`, `print3d_core.py`), the ChimeraX `colorprint.py` and the banner. They were tested headlessly in open-source PyMOL, but not on every PyMOL build or slicer, so expect a few rough edges and please open an issue when you hit one.
+Fair warning: a good part of this repo was vibe-coded with [Claude](https://claude.ai). That includes Script Hub (`script_hub.py`), the 3D-printing tools (`3d_printing/`), the ChimeraX `colorprint.py` and the banner. They were tested headlessly in open-source PyMOL, but not on every PyMOL build or slicer, so expect a few rough edges and please open an issue when you hit one.
 
 The other scripts (`align_chains.py`, `ray_each.py`, `residue_shell.py`, `show_shifted.py`, `apbs.py`, `avg_plddt_pymol.py`, `pym_netcharge.py`, `pca_noise_gradient.py`) are legacy tools I built over time for my own research and still use.
 
