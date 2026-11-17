@@ -1489,29 +1489,38 @@ def pick_filaments(pieces, slots=4, library=None):
     return [(lib[i][0], lib[i][1], float(tot[i] / s)) for i in order]
 
 
-def sweep_tube(path, radii, segments=24):
-    """Closed tube along `path` (k, 3) with per-point radius (k,), flat end
-    caps, rotation-minimizing frames (no twist). Returns (va, ta, ring) where
-    ring[v] is the path index of vertex v (for coloring)."""
+def sweep_tube(path, radii, segments=24, radii2=None, up=None):
+    """Closed tube along `path` (k, 3), flat end caps, no twist. radii (k,)
+    is the radius, or with radii2 the cross-section is an ellipse: radii
+    across, radii2 along `up` (k, 3) (e.g. a strand's face normal), so the
+    tube can flatten to match a strand. Returns (va, ta, ring) where ring[v]
+    is the path index of vertex v (for coloring)."""
     P = np.asarray(path, float)
-    R = np.array(np.broadcast_to(np.asarray(radii, float), (len(P),)))
     k = len(P)
+    R = np.array(np.broadcast_to(np.asarray(radii, float), (k,)))
+    R2 = R if radii2 is None else np.array(np.broadcast_to(np.asarray(radii2, float), (k,)))
     T = np.gradient(P, axis=0)
     T /= np.maximum(np.linalg.norm(T, axis=1), 1e-12)[:, None]
-    a = np.array([1.0, 0, 0]) if abs(T[0, 0]) < 0.9 else np.array([0, 1.0, 0])
-    N = np.cross(T[0], a)
-    N /= np.linalg.norm(N)
-    Ns = [N]
-    for i in range(1, k):                       # parallel transport
-        v = Ns[-1] - T[i] * (Ns[-1] @ T[i])
-        nv = np.linalg.norm(v)
-        Ns.append(v / nv if nv > 1e-9 else Ns[-1])
-    Ns = np.array(Ns)
-    Bs = np.cross(T, Ns)
+    if up is not None:                          # B follows the given direction
+        U = np.array(np.broadcast_to(np.asarray(up, float), (k, 3)))
+        Bs = U - T * np.einsum('ij,ij->i', U, T)[:, None]
+        Bs /= np.maximum(np.linalg.norm(Bs, axis=1), 1e-12)[:, None]
+        Ns = np.cross(Bs, T)
+    else:
+        a = np.array([1.0, 0, 0]) if abs(T[0, 0]) < 0.9 else np.array([0, 1.0, 0])
+        N = np.cross(T[0], a)
+        N /= np.linalg.norm(N)
+        Ns = [N]
+        for i in range(1, k):                   # parallel transport
+            v = Ns[-1] - T[i] * (Ns[-1] @ T[i])
+            nv = np.linalg.norm(v)
+            Ns.append(v / nv if nv > 1e-9 else Ns[-1])
+        Ns = np.array(Ns)
+        Bs = np.cross(T, Ns)
     ang = np.linspace(0, 2 * np.pi, segments, endpoint=False)
     ca, sa = np.cos(ang), np.sin(ang)
-    va = (P[:, None, :] + R[:, None, None] * (ca[None, :, None] * Ns[:, None, :] +
-                                              sa[None, :, None] * Bs[:, None, :])).reshape(-1, 3)
+    va = (P[:, None, :] + R[:, None, None] * ca[None, :, None] * Ns[:, None, :] +
+          R2[:, None, None] * sa[None, :, None] * Bs[:, None, :]).reshape(-1, 3)
     tris = []
     for i in range(k - 1):
         for j in range(segments):

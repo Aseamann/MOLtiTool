@@ -141,7 +141,8 @@ def _msg(lines):
 
 def printstyle(helix_width=3.0, helix_thickness=1.5, strand_width=3.0,
                strand_thickness=1.0, loop_thickness=1.25, stick_radius=0.7,
-               sampling=14, hide_h=1, cylinder_helices=0, helix_radius=2.25, _self=cmd):
+               sampling=14, hide_h=1, cylinder_helices=0, helix_radius=2.25, show_joins=1,
+               _self=cmd):
     """
 DESCRIPTION
 
@@ -157,6 +158,8 @@ USAGE
 
     cylinder_helices = 1: draw helices as solid cylinders (helix_radius A)
              so no support material can get trapped inside them
+    show_joins = 1 (default): show where export joins loops into beta
+             strands (object "strand_joins", display only; 0 removes it)
     """
     s = _self
     s.set('cartoon_oval_length', _f(helix_width) / _HELIX_FACTOR)
@@ -173,11 +176,13 @@ USAGE
     if _b(hide_h):
         s.hide('everything', 'hydro')
     s.rebuild()
+    nj = show_strand_joins(on=show_joins, _self=s)
     _msg(['cartoon helix %.2f x %.2f, strand %.2f x %.2f, loops %.2f, sticks radius %.2f A'
           % (_f(helix_width), _f(helix_thickness), _f(strand_width),
              _f(strand_thickness), _f(loop_thickness), _f(stick_radius))] +
          (['helices as solid cylinders, radius %.2f A' % _f(helix_radius)]
-          if _b(cylinder_helices) else []))
+          if _b(cylinder_helices) else []) +
+         (['showing %d strand-loop joins (object %s)' % (nj, JOINS_OBJECT)] if nj else []))
 
 
 # ---------------------------------------------------------------------------
@@ -1091,7 +1096,7 @@ def _helix_cores(s, names, segments=12, overlap=0.4):
     Returns mesh pieces in Angstrom and the number of helices."""
     pieces, nhel = [], 0
     for obj in names:
-        if obj in _struts_registry or obj.startswith('preview_'):
+        if obj in _struts_registry or _is_overlay(obj):
             continue
         try:
             if int(s.get('cartoon_cylindrical_helices', obj)):
@@ -1185,11 +1190,13 @@ def _center_on_mesh(V, pts, half=0.35, reach=2.6, max_shift=1.0):
 def _strand_joins(s, names, segments=24):
     """PyMOL ends each beta strand in an arrow whose point is the only place
     the next loop touches it, which prints as a weak point. Continue the loop
-    tube smoothly into the strand: one tube swept along the cartoon's own
-    center line, the loop's radius on the loop side, easing down inside the
-    strand so it doesn't bulge out of its faces. Returns (pieces, n)."""
+    into the strand the way ChimeraX does: one tube swept along the cartoon's
+    own center line, round like the loop on the loop side and flattening to
+    the strand's thickness (flush with its faces) inside the strand, so the
+    arrow ends in a blunt tip the width of the loop that flows into the loop.
+    Returns (pieces, n)."""
     pieces, n = [], 0
-    objs = [o for o in names if o not in _struts_registry and not o.startswith('preview_')]
+    objs = [o for o in names if o not in _struts_registry and not _is_overlay(o)]
     meshes = {}
     amap = _cartoon_anchor_map(objs, s, meshes)
     for obj in objs:
@@ -1201,7 +1208,8 @@ def _strand_joins(s, names, segments=24):
             half_t = float(s.get('cartoon_rect_width', obj)) * _STRAND_FACTOR / 2.0
         except Exception:
             continue
-        r_out, r_in = 0.95 * loop_r, 0.9 * min(loop_r, half_t)
+        r_loop = 0.97 * loop_r                  # just inside the loop tube
+        r_flat = 0.96 * min(half_t, loop_r)     # just inside the strand faces
         rows = []
         s.iterate_state(-1, '(%s) and name CA and rep cartoon' % obj,
                         'rows.append((segi, chain, int(resv), ss, color, x, y, z))',
@@ -1223,25 +1231,38 @@ def _strand_joins(s, names, segments=24):
             for i in range(len(run) - 1):
                 if isS[i] == isS[i + 1]:
                     continue
+                si = i if isS[i] else i + 1             # strand residue at the boundary
+                inward = -1 if isS[i] else 1            # direction into the strand
+                s2 = si + inward
+                if not (0 <= s2 < len(run)) or not isS[s2]:
+                    s2 = si
+                # strand face normal: flattest direction of the cartoon around it
+                cen = 0.5 * (ctr[si] + ctr[s2])
+                near = V[np.linalg.norm(V - cen, axis=1) < 2.4]
+                if len(near) < 6:
+                    continue
+                w_, v_ = np.linalg.eigh(np.cov((near - near.mean(0)).T))
+                up = v_[:, 0]
                 idx = list(range(max(i - 1, 0), min(i + 3, len(run))))
-                sub = 8
+                sub = 10
                 path = _catmull([ctr[j] for j in idx], sub)
-                # keep from one residue inside the strand to one residue into the loop
-                pos = np.arange(len(path)) / float(sub) + idx[0]     # residue coordinate
-                if isS[i]:
-                    keep = (pos >= i - 1) & (pos <= i + 1.0)
-                else:
-                    keep = (pos >= i) & (pos <= i + 2)
-                path, pos = path[keep], pos[keep]
+                pos = np.arange(len(path)) / float(sub) + idx[0]
+                # x: 0 at the strand's last residue, 1 at the first loop residue
+                x = (pos - i) if isS[i] else (i + 1 - pos)
+                keep = (x >= -1.0) & (x <= 1.3)
+                path, pos, x = path[keep], pos[keep], x[keep]
                 if len(path) < 4:
                     continue
                 path = _center_on_mesh(V, path)
-                # strand side r_in, loop side r_out, eased across the boundary
-                x = (pos - i) if isS[i] else (i + 1 - pos)     # 0..1 = strand end -> loop start
-                w = np.clip(x, 0, 1)
+                # flat (strand-thick) until the arrow tip, then round like the loop
+                w = np.clip((x - 0.35) / 0.55, 0, 1)
                 w = w * w * (3 - 2 * w)
-                radii = r_in + (r_out - r_in) * w
-                va, ta, ring = pc.sweep_tube(path, radii, segments)
+                thick = r_flat + (r_loop - r_flat) * w
+                # bury the far end inside the loop tube (no near-coincident skin)
+                e = np.clip((x - 0.85) / 0.45, 0, 1)
+                bury = 1.0 - 0.25 * e * e * (3 - 2 * e)
+                va, ta, ring = pc.sweep_tube(path, r_loop * bury, segments,
+                                             radii2=np.minimum(thick, r_loop * bury), up=up)
                 res = np.clip(np.round(pos).astype(int), 0, len(run) - 1)
                 cols = np.array([_cartoon_rgb(s, obj, np.array(
                     [int(round(255 * c)) for c in s.get_color_tuple(run[k][4])], np.uint8))
@@ -1249,6 +1270,44 @@ def _strand_joins(s, names, segments=24):
                 pieces.append((va, ta, cols[ring]))
                 n += 1
     return pieces, n
+
+
+def _is_overlay(name):
+    """Display-only objects that are never exported."""
+    return name.startswith('preview_') or name == JOINS_OBJECT
+
+
+JOINS_OBJECT = 'strand_joins'
+
+
+def show_strand_joins(objects='', on=1, _self=cmd):
+    """
+DESCRIPTION
+
+    Show (on=1) in PyMOL the tubes that colorprint adds where loops meet beta
+    strands (join_strands=1), as the display-only object "strand_joins"
+    (never exported; colorprint builds its own). on=0 removes it.
+    Redrawn by printstyle (show_joins=1) and after each colorprint.
+
+USAGE
+
+    show_strand_joins [objects [, on ]]
+    """
+    s = _self
+    s.delete(JOINS_OBJECT)
+    if not _b(on):
+        return 0
+    names = [n for n in str(objects).replace(',', ' ').split() if n] or \
+        [n for n in s.get_names('objects', enabled_only=1)
+         if not _is_overlay(n) and n not in _struts_registry]
+    pieces, nj = _strand_joins(s, names, 24)
+    if not pieces:
+        return 0
+    cg = []
+    for va, ta, vc in pieces:
+        cg += pc.mesh_cgo(va, ta, np.asarray(vc)[np.asarray(ta)[:, 0]])
+    s.load_cgo(cg, JOINS_OBJECT)
+    return nj
 
 
 def _single_bonds(s, objects=None):
@@ -1304,7 +1363,7 @@ def _vrml_of(s, names, temp_cgo=None):
     restore = None
     if not names:       # "everything shown", but never the preview objects
         names = [n for n in s.get_names('objects', enabled_only=1)
-                 if not n.startswith('preview_')]
+                 if not _is_overlay(n)]
     if temp_cgo:
         s.load_cgo(temp_cgo[1], temp_cgo[0])
         names = list(names) + [temp_cgo[0]]
@@ -1615,7 +1674,7 @@ ARGUMENTS
     groups = []                     # (label, names, temp_cgo)
     if each:
         targets = [n for n in (names or s.get_names('objects', enabled_only=1))
-                   if not n.startswith('preview_')]
+                   if not _is_overlay(n)]
         strut_objs = [n for n in targets if n in _struts_registry] if names else \
             [n for n in _struts_registry if n in targets]
         for obj in [n for n in targets if n not in _struts_registry]:
@@ -1642,7 +1701,7 @@ ARGUMENTS
             pieces = pc.vrml_to_pieces(vr, seg, _b(o['round_ends']), _b(o['close_ends']),
                                        notes, info)
             gn = gnames or [n for n in s.get_names('objects', enabled_only=1)
-                            if not n.startswith('preview_')]
+                            if not _is_overlay(n)]
             if pieces and _b(o['join_strands']):
                 joins, nj = _strand_joins(s, gn, max(16, 2 * seg))
                 pieces += joins
@@ -1916,6 +1975,8 @@ ARGUMENTS
             out_files += _write_group(parts, fmt, path_stem, ext, g['label'], slot_of,
                                       pal_names, report)
     report += notes_all
+    if JOINS_OBJECT in s.get_names('objects'):
+        show_strand_joins(on=_b(o['join_strands']), _self=s)
     if preview:
         s.delete('preview_printer')
         s.delete('preview_thin')
@@ -2170,6 +2231,7 @@ cmd.extend('split_parts', split_parts)
 cmd.extend('surfacestyle', surfacestyle)
 cmd.extend('print3d_printers', print3d_printers)
 cmd.extend('auto_filaments', auto_filaments)
+cmd.extend('show_strand_joins', show_strand_joins)
 cmd.extend('colorprint', colorprint)
 cmd.extend('snapfit', snapfit)
 cmd.extend('snapfit_clear', snapfit_clear)

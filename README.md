@@ -30,7 +30,7 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
   - **printer profiles** for Anycubic (Kobra X, Kobra 3, Kobra S1, S1 Max, Kobra 3 Max), Bambu Lab (A1 mini, A1, A2L, P1S/P1P, X1 Carbon), Prusa (MINI+, MK4S, CORE One) and Creality (K1C, K2 Plus), or type your own build volume: the report says whether the model fits and whether it uses more colors than you have filament slots, and `fit=1` scales it to fill the printer
   - **Preview in PyMOL**: see the finished print (base, pegs, rods, colors) over your molecule before writing anything, with the build volume drawn around it and anything thinner than your nozzle can print painted red
   - loose pieces (side chains that end just off the cartoon) joined with short rods
-  - beta-strand arrows joined solidly to their loops (PyMOL's arrow tip alone is a weak point)
+  - beta-strand arrows joined solidly to their loops, ChimeraX-style: the loop continues into the strand and the arrow ends in a blunt tip the width of the loop (shown live as `strand_joins` when you apply thickness)
   - a report: size, grams of filament, parts thinner than your nozzle can handle, anything still floating, bed contact
 - `print3d_preset`: save and reuse whole setups by name. Four are built in: **Multi-color Printer Cartoon**, **Single Color Printer Cartoon**, **Multi-color Printer Surface** and **Single Color Printer Surface**
 

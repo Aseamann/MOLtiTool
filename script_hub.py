@@ -63,7 +63,10 @@ HELP = {
         'Sets how thick the cartoon and sticks are, in Angstrom (full width and thickness, '
         'the same meaning as ChimeraX). Applies to every object. Once scaled, parts thinner '
         'than about 1.5 mm break easily on an FDM printer; the export report warns about '
-        'them. Smoothness is PyMOL\'s cartoon_sampling (higher is smoother, files get bigger).'),
+        'them. Smoothness is PyMOL\'s cartoon_sampling (higher is smoother, files get bigger).\n'
+        '"Show strand-loop joins" draws (object strand_joins) how the export runs each loop '
+        'into its beta strand: PyMOL\'s arrow tip alone is a weak point, so the loop continues '
+        'into the strand and the arrow ends in a blunt tip the width of the loop.'),
     'separate': (
         'Copies ligands or chains into their own objects, so each is surfaced on its own '
         '(the protein never cuts into a ligand surface) and can be exported as its own file.\n'
@@ -516,6 +519,12 @@ def make_panel(parent=None):
             hh = R('hide_h', W.QCheckBox('Hide hydrogens'))
             hh.setChecked(True)
             f.addRow(hh)
+            sj = R('show_joins', W.QCheckBox('Show strand-loop joins'))
+            sj.setChecked(True)
+            sj.setToolTip('Shows, as the object "strand_joins", where the export runs each loop '
+                          'into its beta strand (a blunt arrow tip the width of the loop). '
+                          'Display only; the export builds its own.')
+            f.addRow(sj)
             ch = R('cylinder_helices', W.QCheckBox('Helices as solid cylinders (no supports inside)'))
             f.addRow(ch)
             f.addRow('Cylinder radius', R('helix_radius', self._dspin(2.25, 0.5, 6.0, 0.25, 2)))
@@ -764,8 +773,10 @@ def make_panel(parent=None):
             js_ = R('join_strands', W.QCheckBox('Join strand arrows to their loops'))
             js_.setChecked(True)
             js_.setToolTip('PyMOL ends strands in an arrow whose tip is the only contact with '
-                           'the next loop. This runs the loop into the strand with a short rod '
-                           'along the center line, so the joint does not break.')
+                           'the next loop. This runs the loop into the strand along the cartoon\'s '
+                           'center line, flattening to the strand\'s thickness, so the arrow ends '
+                           'in a blunt tip the width of the loop (as in ChimeraX) and the joint '
+                           'does not break. "Show strand-loop joins" under Thickness shows it.')
             f.addRow(js_)
 
             adv_toggle = W.QCheckBox('Show advanced options')
@@ -1000,7 +1011,8 @@ def make_panel(parent=None):
 
         # --- snap-fit ---
         def _refresh_objects(self):
-            names = [n for n in cmd.get_names('objects') if n not in print3d._struts_registry]
+            names = [n for n in cmd.get_names('objects')
+                     if n not in print3d._struts_registry and not print3d._is_overlay(n)]
             for c in (self.sf_host, self.sf_guest):
                 cur = c.currentText()
                 c.clear()
