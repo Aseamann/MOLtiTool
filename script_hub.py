@@ -76,12 +76,14 @@ HELP = {
         'are close in space (Max length, A) but far apart along the chain (Min loop, A). '
         'Leave Color blank and each strut takes the color of its chain (half and half if it '
         'joins two chains); type a color to use one color for all. "Add struts" replaces the '
-        'previous set in that object.\n'
+        'previous set in that object. Strut ends: PyMOL smooths beta strands flat, so their '
+        'CA atoms sit up to 1.5 A off the ribbon; "Cartoon center line" (default) joins '
+        'struts to the middle of the cartoon so they meet strands squarely.\n'
         'Single struts: type two atoms or residues (a residue uses its CA), or select two in '
         'the viewer and press "From sele". "Add strut" adds one, "Remove strut" removes the '
         'one between them; leave Atom 2 blank to remove every strut at Atom 1.\n'
         'To remove a strut you can see: click it in the viewer (that selects it and the log '
-        'prints its ID), then press "Remove selected". "Show strut labels" puts an ID such '
+        'prints its ID), then press "Remove selected" or the Delete key. "Show strut labels" puts an ID such '
         'as "S3 A:LYS45-A:GLU112" on every strut.'),
     'snapfit': (
         'For parts printed separately, such as a ligand that should click onto its protein. '
@@ -589,6 +591,11 @@ def make_panel(parent=None):
             R('color', scol)
             f.addRow('Color', crow)
             f.addRow('Object name', R('name', W.QLineEdit('struts')))
+            ac = R('anchor', self._combo([('cartoon', 'Cartoon center line'), ('atom', 'Exactly at atoms')]))
+            ac.setToolTip('Beta strands are smoothed flat, so their CA atoms sit up to 1.5 A off '
+                          'the ribbon. "Cartoon center line" joins struts to the middle of the '
+                          'cartoon instead, so they meet strands squarely.')
+            f.addRow('Strut ends', ac)
             h_ = W.QHBoxLayout()
             b1, b2 = W.QPushButton('Add struts'), W.QPushButton('Delete struts')
             b1.clicked.connect(lambda: self._run('Struts', print3d.struts, replace=1,
@@ -614,7 +621,7 @@ def make_panel(parent=None):
             ba.clicked.connect(lambda: self._run(
                 'Add strut', print3d.strut_add, self.sa1.text(), self.sa2.text(),
                 self._values('struts')['name'] or 'struts', self._values('struts')['radius'],
-                self._values('struts')['color']))
+                self._values('struts')['color'], self._values('struts')['anchor']))
             br.clicked.connect(lambda: self._run(
                 'Remove strut', print3d.strut_remove, self.sa1.text(), self.sa2.text(), ''))
             for b_ in (bs, ba, br):

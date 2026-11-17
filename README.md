@@ -16,7 +16,7 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
 - `printstyle`: thicker cartoon (helix, strand, loop) and sticks, in real Angstrom widths; double and aromatic bonds as one full stick; optional solid-cylinder helices
 - `surfacestyle`: surface resolution (draft to maximum), probe radius, molecular or solvent-accessible surface, smoothed edges
 - `split_parts`: separate ligands (substrates, cofactors, inhibitors) or chains into their own objects, each surfaced on its own so nothing cuts into it
-- `struts`: support rods between residues close in space but far along the chain (same rules as ChimeraX `struts`), colored like their chain; click a strut to select and remove it, show ID labels, or add one between any two residues
+- `struts`: support rods between residues close in space but far along the chain (same rules as ChimeraX `struts`), joined to the cartoon's center line so they meet beta strands squarely, colored like their chain; click a strut and press Delete (or Remove selected) to remove it, show ID labels, or add one between any two residues
 - `snapfit`: join two separately printed parts at their contact with a peg and walled socket, or magnet pockets, with a seat cut to shape and print clearance
 - `colorprint`: export with your colors
   - **3MF** opens ready to slice in OrcaSlicer, Anycubic Slicer Next and Bambu Studio, with every part already on its filament slot (and painted where colors mix)

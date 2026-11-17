@@ -285,16 +285,107 @@ def _chain_color_lookup(s):
     return color_of
 
 
+def _ends(st, radius=0.0):
+    """Where a strut is drawn. Ends anchored on the cartoon (d1/d2, points on
+    its center line) are pulled back by the strut radius, so the round tip
+    stops at the middle of the ribbon instead of poking out the far side.
+    Other ends sit at the atoms (p1/p2). p1/p2 always stay the atom positions,
+    so struts keep matching their atoms."""
+    a = np.asarray(st.get('d1', st['p1']), float)
+    b = np.asarray(st.get('d2', st['p2']), float)
+    d = b - a
+    n = float(np.linalg.norm(d))
+    r = float(radius)
+    if r > 0 and n > 1e-6:
+        u = d / n
+        pull = min(r, 0.25 * n)          # never shrink a short strut away
+        if 'd1' in st:
+            a = a + u * pull
+        if 'd2' in st:
+            b = b - u * pull
+    return a, b
+
+
+def _pkey(xyz):
+    return tuple(int(round(float(v) * 100)) for v in xyz)
+
+
+def _cartoon_anchor_map(models, s):
+    """{(model, atom-position key): point on the cartoon's center line} for
+    every CA shown as cartoon. PyMOL smooths beta strands flat, so a strand's
+    CA atoms zig-zag up to ~1.5 A off the ribbon; a strut ending on the
+    center line meets the strand squarely instead of poking out of one face."""
+    out = {}
+    for model in models:
+        if model not in s.get_names('objects') or not s.count_atoms(
+                '(%s) and name CA and rep cartoon' % model):
+            continue
+        reps = {}
+        s.iterate(model, 'R[index] = reps', space={'R': reps})
+        idx = [k for k, v in reps.items() if v & 32]          # 32 = cartoon bit
+        try:
+            s.hide('everything', model)          # VRML of the cartoon alone
+            for k in range(0, len(idx), 400):
+                s.show('cartoon', '%s and index %s' % (model, '+'.join(map(str, idx[k:k + 400]))))
+            vr = _vrml_of(s, [model])
+        finally:
+            s.alter(model, 'reps = R[index]', space={'R': reps})
+            s.rebuild(model)
+        pieces = pc.vrml_to_pieces(vr, 6, True, False, [], {})
+        if not pieces:
+            continue
+        V = np.vstack([va for va, _, _ in pieces])
+        rows = []
+        s.iterate_state(-1, '(%s) and name CA and rep cartoon' % model,
+                        'rows.append((segi, chain, int(resv), x, y, z))',
+                        space={'rows': rows, 'int': int})
+        rows.sort(key=lambda r: (r[0], r[1], r[2]))
+        xyz = np.array([r[3:] for r in rows], float)
+        for i, r in enumerate(rows):
+            prev = i - 1 if i > 0 and rows[i - 1][:2] == r[:2] and rows[i - 1][2] == r[2] - 1 else None
+            nxt = i + 1 if i + 1 < len(rows) and rows[i + 1][:2] == r[:2] and \
+                rows[i + 1][2] == r[2] + 1 else None
+            if prev is None and nxt is None:
+                continue
+            t = xyz[nxt if nxt is not None else i] - xyz[prev if prev is not None else i]
+            nt = np.linalg.norm(t)
+            if nt < 1e-6:
+                continue
+            t /= nt
+            d = V - xyz[i]
+            along = d @ t
+            lat = np.linalg.norm(d - np.outer(along, t), axis=1)
+            sel = (np.abs(along) < 0.6) & (lat < 3.0)
+            if sel.sum() < 4:
+                continue
+            c = V[sel].mean(0)
+            if np.linalg.norm(c - xyz[i]) < 2.5:
+                out[(model, _pkey(xyz[i]))] = c
+    return out
+
+
+def _anchor_struts(struts, s):
+    amap = _cartoon_anchor_map(sorted({st['m1'] for st in struts} | {st['m2'] for st in struts}), s)
+    moved = 0
+    for st in struts:
+        for pk, dk, mk in (('p1', 'd1', 'm1'), ('p2', 'd2', 'm2')):
+            a = amap.get((st[mk], _pkey(st[pk])))
+            if a is not None:
+                st[dk] = a
+                moved += 1
+    return moved
+
+
 def _strut_cgo(struts, radius, color, s=cmd):
     """CGO rods. color None = each half takes the color of its end's chain."""
     color_of = _chain_color_lookup(s) if color is None else None
     obj = []
     for st in struts:
-        p1, p2 = np.asarray(st['p1'], float), np.asarray(st['p2'], float)
+        p1, p2 = _ends(st, radius)
         if color is not None:
             c1 = c2 = tuple(color)
         else:
-            c1, c2 = color_of(st['m1'], p1), color_of(st['m2'], p2)
+            c1, c2 = color_of(st['m1'], st['p1']), color_of(st['m2'], st['p2'])
         if c1 == c2:
             segs = [(p1, p2, c1)]
         else:                          # two halves, one per chain color
@@ -334,7 +425,7 @@ def _draw_struts(name, s):
             a.chain = 'S'
             a.symbol = 'PS'          # pseudo-atom: never counted as ligand/organic
             a.hetatm = 1
-            a.coord = [float(x) for x in st[key]]
+            a.coord = [float(x) for x in _ends(st, entry['radius'])[j]]
             m.add_atom(a)
             mdl = st['m1'] if j == 0 else st['m2']
             colors.append(tuple(entry['color']) if color_of is None else color_of(mdl, st[key]))
@@ -343,20 +434,50 @@ def _draw_struts(name, s):
         b.order = 1
         m.add_bond(b)
     s.load_model(m, name)
+    if name not in s.get_names('objects'):
+        s.load_model(m, name)                # once more (seen after undo in PyMOL 3)
+    if name not in s.get_names('objects'):
+        print(' struts: could not draw "%s"; run struts again' % name)
+        return
     s.hide('everything', name)
     s.show('sticks', name)
     s.set('stick_radius', float(entry['radius']), name)
     s.flag('ignore', name, 'set')            # keep them out of surfaces
+    cidx = {}
     for i, c in enumerate(colors):
-        k, j = i // 2 + 1, i % 2 + 1
-        s.color('0x%02x%02x%02x' % tuple(int(round(v * 255)) for v in c),
-                '%s and resi %d and name E%d' % (name, k, j))
+        hx = '0x%02x%02x%02x' % tuple(int(round(v * 255)) for v in c)
+        cidx[(i // 2 + 1, 'E%d' % (i % 2 + 1))] = s.get_color_index(hx)
+    s.alter(name, 'color = C.get((int(resv), name), color)', space={'C': cidx, 'int': int})
+    s.rebuild(name)
     if entry.get('labels'):
         s.set('label_size', 14, name)
         for k, st in enumerate(entry['struts'], start=1):
             s.label('%s and resi %d and name E1' % (name, k), repr(_strut_label(k, st)))
     if not was_enabled:
         s.disable(name)
+
+
+def _sync_struts(s, names=None):
+    """Struts whose atoms were removed in the viewer (e.g. clicked and the
+    Delete key pressed) are dropped from the registry, so they stay gone."""
+    dropped = 0
+    for name in (list(_struts_registry) if names is None else names):
+        entry = _struts_registry.get(name)
+        if not entry or name not in s.get_names('objects'):
+            continue
+        have = set()
+        s.iterate(name, 'H.add((int(resv), name))', space={'H': have, 'int': int})
+        n = len(entry['struts'])
+        if len(have) == 2 * n:
+            continue
+        keep = [st for k, st in enumerate(entry['struts'], start=1)
+                if (k, 'E1') in have and (k, 'E2') in have]
+        dropped += n - len(keep)
+        entry['struts'] = keep
+        _draw_struts(name, s)
+    if dropped:
+        _msg(['%d strut(s) removed in the viewer were dropped' % dropped])
+    return dropped
 
 
 def _rgb_or_none(color, s):
@@ -372,7 +493,7 @@ def _rgb_or_none(color, s):
 
 
 def struts(selection='name CA', length=8.0, loop=60.0, radius=0.5,
-           color='', name='struts', replace=1, _self=cmd):
+           color='', name='struts', replace=1, anchor='cartoon', _self=cmd):
     """
 DESCRIPTION
 
@@ -382,16 +503,21 @@ DESCRIPTION
 
     color: blank (default) = each strut takes the color of its chain; give a
     color (e.g. grey70) to use one color for all.
+    anchor: cartoon (default) = ends of struts on CA atoms shown as cartoon
+    sit on the cartoon's center line (beta strands are smoothed, so their CA
+    atoms sit off the ribbon); atom = exactly at the atoms.
 
 USAGE
 
-    struts [selection [, length [, loop [, radius [, color [, name [, replace ]]]]]]]
+    struts [selection [, length [, loop [, radius [, color [, name [, replace
+           [, anchor ]]]]]]]]
 
 SEE ALSO
 
     strut_add, strut_remove, struts_delete
     """
     s = _self
+    _sync_struts(s)
     length, loop, radius = _f(length), _f(loop), _f(radius)
     keys, xyz, adj, labels = _bond_graph(selection, s)
     key_index = {k: i for i, k in enumerate(keys)}
@@ -436,8 +562,11 @@ SEE ALSO
             sc.setdefault(i1, []).append((i2, d))
             sc.setdefault(i2, []).append((i1, d))
 
+    if str(anchor).lower().startswith('cart') and new:
+        _anchor_struts(new, s)
     _last['struts'] = dict(selection=selection, length=length, loop=loop, radius=radius,
-                           color=color if isinstance(color, str) else '')
+                           color=color if isinstance(color, str) else '',
+                           anchor='cartoon' if str(anchor).lower().startswith('cart') else 'atom')
     old_labels = _struts_registry.get(name, {}).get('labels', False)
     _struts_registry[name] = dict(struts=previous + new, radius=radius,
                                   color=_rgb_or_none(color, s), labels=old_labels)
@@ -464,7 +593,7 @@ def _one_atom(sel, s):
     return a.model, np.array(a.coord, float), '%s:%s%s' % (a.chain, a.resn, a.resi)
 
 
-def strut_add(atom1, atom2, name='struts', radius=-1.0, color='', _self=cmd):
+def strut_add(atom1, atom2, name='struts', radius=-1.0, color='', anchor='cartoon', _self=cmd):
     """
 DESCRIPTION
 
@@ -472,7 +601,10 @@ DESCRIPTION
 
 USAGE
 
-    strut_add atom1, atom2 [, name [, radius [, color ]]]
+    strut_add atom1, atom2 [, name [, radius [, color [, anchor ]]]]
+
+    anchor = cartoon (default): a CA shown as cartoon is joined at the
+             cartoon's center line; atom: exactly at the atom
 
 EXAMPLE
 
@@ -480,6 +612,7 @@ EXAMPLE
     strut_add chain A and resi 45, chain A and resi 112
     """
     s = _self
+    _sync_struts(s)
     try:
         m1, p1, l1 = _one_atom(atom1, s)
         m2, p2, l2 = _one_atom(atom2, s)
@@ -493,7 +626,10 @@ EXAMPLE
         entry['radius'] = float(radius)
     if str(color).strip():
         entry['color'] = _rgb_or_none(color, s)
-    entry['struts'].append(dict(p1=p1, p2=p2, m1=m1, m2=m2, l1=l1, l2=l2))
+    st = dict(p1=p1, p2=p2, m1=m1, m2=m2, l1=l1, l2=l2)
+    if str(anchor).lower().startswith('cart'):
+        _anchor_struts([st], s)
+    entry['struts'].append(st)
     _draw_struts(name, s)
     _msg(['strut S%d added %s to %s (%.1f A), object "%s"'
           % (len(entry['struts']), l1, l2, np.linalg.norm(p1 - p2), name)])
@@ -512,6 +648,7 @@ USAGE
     strut_remove atom1 [, atom2 [, name ]]
     """
     s = _self
+    _sync_struts(s)
     try:
         _, p1, l1 = _one_atom(atom1, s)
         p2 = _one_atom(atom2, s)[1] if str(atom2).strip() else None
@@ -566,7 +703,11 @@ USAGE
             s.iterate('(%s) and %s' % (selection, nm), 'stored._p3d.append(int(resv))')
         except Exception:
             continue
-        idx = sorted(set(stored._p3d), reverse=True)
+        have = set()
+        s.iterate(nm, 'H.add((int(resv), name))', space={'H': have, 'int': int})
+        gone = [k for k in range(1, len(entry['struts']) + 1)
+                if (k, 'E1') not in have or (k, 'E2') not in have]   # deleted in the viewer
+        idx = sorted(set(stored._p3d) | set(gone), reverse=True)
         for k in idx:
             if 1 <= k <= len(entry['struts']):
                 removed.append(_strut_label(k, entry['struts'][k - 1]))
@@ -591,6 +732,7 @@ USAGE
     struts_label [on [, name ]]
     """
     s = _self
+    _sync_struts(s)
     for nm in ([name] if name else list(_struts_registry)):
         if nm in _struts_registry:
             _struts_registry[nm]['labels'] = _b(on)
@@ -1344,7 +1486,9 @@ ARGUMENTS
     _last['export'] = {k: o[k] for k in EXPORT_DEFAULTS}
     solid_ok = pc.have_manifold()
 
-    # struts colored by chain follow any recoloring done since they were made
+    # struts deleted in the viewer stay deleted; struts colored by chain
+    # follow any recoloring done since they were made
+    _sync_struts(s)
     for sname, e in list(_struts_registry.items()):
         if e.get('color') is None and sname in s.get_names('objects'):
             _draw_struts(sname, s)
