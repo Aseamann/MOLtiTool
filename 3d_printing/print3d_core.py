@@ -442,9 +442,8 @@ def union_same_color(pieces, notes):
     for color, plist in groups.items():
         solids, raw = [], []
         for va, ta in plist:
-            m = mf.Manifold(mf.Mesh(vert_properties=np.ascontiguousarray(va, np.float32),
-                                    tri_verts=np.ascontiguousarray(ta, np.uint32)))
-            if m.status() == mf.Error.NoError and not m.is_empty():
+            m = make_manifold(va, ta)
+            if m is not None:
                 solids.append(m)
             else:
                 raw.append((va, ta))
@@ -635,15 +634,38 @@ def palette_mapping(colors, palette):
 # colored solids
 # ---------------------------------------------------------------------------
 
+def _arr(a, dtype, cols=None):
+    """Fresh, writable, C-ordered copy for manifold3d (it rejects read-only
+    arrays, which numpy 1.x hands back from manifold meshes)."""
+    a = np.array(a, dtype=dtype, order='C', copy=True)
+    if cols is not None:
+        a = a.reshape(-1, cols)
+    return a
+
+
+def make_manifold(vert_properties, tri_verts, merge_from=None, merge_to=None):
+    """Manifold from arrays, or None if it isn't a valid closed solid."""
+    import manifold3d as mf
+    vp = np.asarray(vert_properties)
+    kw = dict(vert_properties=_arr(vp, np.float32, vp.shape[-1] if vp.ndim > 1 else 3),
+              tri_verts=_arr(tri_verts, np.uint32, 3))
+    if len(kw['tri_verts']) == 0 or len(kw['vert_properties']) == 0:
+        return None
+    if merge_from is not None and len(merge_from):
+        kw['merge_from_vert'] = _arr(merge_from, np.uint32)
+        kw['merge_to_vert'] = _arr(merge_to, np.uint32)
+    try:
+        m = mf.Manifold(mf.Mesh(**kw))
+    except (TypeError, ValueError):
+        return None
+    return m if m.status() == mf.Error.NoError and not m.is_empty() else None
+
+
 def colored_solid(va, ta, vc):
     """Manifold with rgb (0-1) carried as vertex properties, or None."""
     import manifold3d as mf
     vp = np.hstack([np.asarray(va, np.float64), np.asarray(vc, np.float64)[:, :3] / 255.0])
-    m = mf.Manifold(mf.Mesh(vert_properties=np.ascontiguousarray(vp, np.float32),
-                            tri_verts=np.ascontiguousarray(ta, np.uint32)))
-    if m.status() != mf.Error.NoError or m.is_empty():
-        return None
-    return m
+    return make_manifold(vp, ta)
 
 
 def solid_mesh(m):
@@ -660,14 +682,8 @@ def solid_mesh(m):
 
 def _mesh_with(me, vert_properties):
     import manifold3d as mf
-    kw = dict(vert_properties=np.ascontiguousarray(vert_properties, np.float32),
-              tri_verts=np.ascontiguousarray(np.asarray(me.tri_verts), np.uint32))
-    mfrom, mto = np.asarray(me.merge_from_vert), np.asarray(me.merge_to_vert)
-    if len(mfrom):
-        kw['merge_from_vert'] = np.ascontiguousarray(mfrom, np.uint32)
-        kw['merge_to_vert'] = np.ascontiguousarray(mto, np.uint32)
-    m = mf.Manifold(mf.Mesh(**kw))
-    return m if m.status() == mf.Error.NoError and not m.is_empty() else None
+    return make_manifold(vert_properties, me.tri_verts,
+                         np.asarray(me.merge_from_vert), np.asarray(me.merge_to_vert))
 
 
 def tint(m, rgb255):
@@ -1471,3 +1487,46 @@ def pick_filaments(pieces, slots=4, library=None):
     order = [int(i) for i in np.argsort(-tot) if tot[i] > 0][:max(1, int(slots))]
     s = tot.sum() or 1.0
     return [(lib[i][0], lib[i][1], float(tot[i] / s)) for i in order]
+
+
+def sweep_tube(path, radii, segments=24):
+    """Closed tube along `path` (k, 3) with per-point radius (k,), flat end
+    caps, rotation-minimizing frames (no twist). Returns (va, ta, ring) where
+    ring[v] is the path index of vertex v (for coloring)."""
+    P = np.asarray(path, float)
+    R = np.array(np.broadcast_to(np.asarray(radii, float), (len(P),)))
+    k = len(P)
+    T = np.gradient(P, axis=0)
+    T /= np.maximum(np.linalg.norm(T, axis=1), 1e-12)[:, None]
+    a = np.array([1.0, 0, 0]) if abs(T[0, 0]) < 0.9 else np.array([0, 1.0, 0])
+    N = np.cross(T[0], a)
+    N /= np.linalg.norm(N)
+    Ns = [N]
+    for i in range(1, k):                       # parallel transport
+        v = Ns[-1] - T[i] * (Ns[-1] @ T[i])
+        nv = np.linalg.norm(v)
+        Ns.append(v / nv if nv > 1e-9 else Ns[-1])
+    Ns = np.array(Ns)
+    Bs = np.cross(T, Ns)
+    ang = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+    ca, sa = np.cos(ang), np.sin(ang)
+    va = (P[:, None, :] + R[:, None, None] * (ca[None, :, None] * Ns[:, None, :] +
+                                              sa[None, :, None] * Bs[:, None, :])).reshape(-1, 3)
+    tris = []
+    for i in range(k - 1):
+        for j in range(segments):
+            a0, a1 = i * segments + j, i * segments + (j + 1) % segments
+            b0, b1 = a0 + segments, a1 + segments
+            tris += [(a0, a1, b1), (a0, b1, b0)]
+    c0, c1 = len(va), len(va) + 1
+    va = np.vstack([va, P[0], P[-1]])
+    for j in range(segments):
+        tris.append((c0, (j + 1) % segments, j))
+        tris.append((c1, (k - 1) * segments + j, (k - 1) * segments + (j + 1) % segments))
+    ring = np.concatenate([np.repeat(np.arange(k), segments), [0, k - 1]])
+    ta = np.array(tris, np.int64)
+    # outward winding check (signed volume)
+    v0, v1, v2 = va[ta[:, 0]], va[ta[:, 1]], va[ta[:, 2]]
+    if np.einsum('ij,ij->i', v0, np.cross(v1, v2)).sum() < 0:
+        ta = ta[:, ::-1]
+    return va, ta, ring

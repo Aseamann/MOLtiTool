@@ -113,7 +113,7 @@ HELP = {
         'Longest side sets the printed size (or use the scale). "As on screen" prints the '
         'model the way you see it, screen-down on the bed. Filament colors: every color snaps '
         'to the closest loaded filament; "Auto-pick" fills the slots with common PLA colors closest to the scene. Single-color printer: one file per color, smaller '
-        'pieces plug into sockets. Base: flat cut, or a stand with pillars. The report lists '
+        'pieces plug into sockets. Base: flat cut, or a stand with pillars. "Join strand arrows" (on by default) runs each loop into its strand, since an arrow tip alone is a weak joint. The report lists '
         'size, grams, thin parts, floating pieces and bed contact.'),
     'scripts': (
         'Every .py file in this folder, with the commands it adds. Pick a command, fill in '
@@ -761,6 +761,12 @@ def make_panel(parent=None):
             f.addRow('Cut depth (mm)', R('base_depth', self._dspin(1.0, 0.1, 20, 0.5, 1)))
             f.addRow('Stand pillars', R('pillars', self._ispin(3, 1, 12)))
             f.addRow('Pillar thickness (mm)', R('pillar_d', self._auto(self._dspin(0.0, 0, 20, 0.5, 1))))
+            js_ = R('join_strands', W.QCheckBox('Join strand arrows to their loops'))
+            js_.setChecked(True)
+            js_.setToolTip('PyMOL ends strands in an arrow whose tip is the only contact with '
+                           'the next loop. This runs the loop into the strand with a short rod '
+                           'along the center line, so the joint does not break.')
+            f.addRow(js_)
 
             adv_toggle = W.QCheckBox('Show advanced options')
             adv = W.QWidget()
@@ -803,7 +809,13 @@ def make_panel(parent=None):
             self.merge_lbl.setWordWrap(True)
             self.merge_btn = W.QPushButton('Install merge library (manifold3d)')
             self.merge_btn.clicked.connect(self._install_merge)
+            self.use_merge = R('use_manifold', W.QCheckBox('Use merge library (manifold3d)'))
+            self.use_merge.setChecked(True)
+            self.use_merge.setToolTip('Untick to export plain capped meshes without the merge '
+                                      'library, to compare. Merging, bases, connectors, '
+                                      'single-color sockets and parts of the report need it.')
             f.addRow(self.merge_lbl)
+            f.addRow(self.use_merge)
             f.addRow(self.merge_btn)
             self._update_merge_status()
             v.addWidget(g)
@@ -1013,6 +1025,7 @@ def make_panel(parent=None):
                                    'Merge library not installed: merging, connectors, base, '
                                    'single-color sockets and the full report need it.')
             self.merge_btn.setVisible(not ok)
+            self.use_merge.setEnabled(ok)
 
         def _install_merge(self):
             self._say('Installing manifold3d (this can take a minute)...')

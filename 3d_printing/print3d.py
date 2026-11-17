@@ -310,7 +310,7 @@ def _pkey(xyz):
     return tuple(int(round(float(v) * 100)) for v in xyz)
 
 
-def _cartoon_anchor_map(models, s):
+def _cartoon_anchor_map(models, s, meshes=None):
     """{(model, atom-position key): point on the cartoon's center line} for
     every CA shown as cartoon. PyMOL smooths beta strands flat, so a strand's
     CA atoms zig-zag up to ~1.5 A off the ribbon; a strut ending on the
@@ -335,6 +335,8 @@ def _cartoon_anchor_map(models, s):
         if not pieces:
             continue
         V = np.vstack([va for va, _, _ in pieces])
+        if meshes is not None:
+            meshes[model] = V
         rows = []
         s.iterate_state(-1, '(%s) and name CA and rep cartoon' % model,
                         'rows.append((segi, chain, int(resv), x, y, z))',
@@ -1064,7 +1066,8 @@ _last = {}                # last-used options per section (for presets)
 EXPORT_DEFAULTS = dict(objects='', format='3mf', each=0, size_mm=0.0, mm_per_A=1.0,
                        nozzle=0.4, layer_height=0.2, preview=0, printer='', bed_x=0.0,
                        bed_y=0.0, bed_z=0.0, slots=0, fit=0, show_bed=1, show_thin=1,
-                       helix_core=0, support_angle=30.0, show_overhang=0,
+                       helix_core=0, support_angle=30.0, show_overhang=0, join_strands=1,
+                       use_manifold=1,
                        orient='view', filaments='', base='none', base_depth=1.0,
                        pillars=3, pillar_d=0.0, min_feature=0.0, attach=1, attach_mm=4.0,
                        single_color=0, socket_clearance=0.0,
@@ -1138,6 +1141,114 @@ def _helix_cores(s, names, segments=12, overlap=0.4):
                 pieces.append((va, ta, np.tile(col, (len(va), 1))))
             nhel += 1
     return pieces, nhel
+
+
+def _catmull(pts, sub=4):
+    """Smooth path through pts (Catmull-Rom), sub points per span."""
+    P = np.asarray(pts, float)
+    if len(P) < 2:
+        return P
+    Q = np.vstack([2 * P[0] - P[1], P, 2 * P[-1] - P[-2]])
+    out = []
+    for i in range(1, len(Q) - 2):
+        p0, p1, p2, p3 = Q[i - 1], Q[i], Q[i + 1], Q[i + 2]
+        for t in np.linspace(0, 1, sub, endpoint=False):
+            t2, t3 = t * t, t * t * t
+            out.append(0.5 * (2 * p1 + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+                              (3 * p1 - p0 - 3 * p2 + p3) * t3))
+    out.append(P[-1])
+    return np.array(out)
+
+
+def _center_on_mesh(V, pts, half=0.35, reach=2.6, max_shift=1.0):
+    """Move each point to the middle of the cartoon cross-section around it."""
+    P = np.asarray(pts, float)
+    T = np.gradient(P, axis=0)
+    T /= np.maximum(np.linalg.norm(T, axis=1), 1e-12)[:, None]
+    out = P.copy()
+    near = V[np.linalg.norm(V - P.mean(0), axis=1) < np.linalg.norm(np.ptp(P, axis=0)) + reach + 2]
+    for k, (p_, t) in enumerate(zip(P, T)):
+        d = near - p_
+        along = d @ t
+        lat = np.linalg.norm(d - np.outer(along, t), axis=1)
+        sel = (np.abs(along) < half) & (lat < reach)
+        if sel.sum() >= 6:
+            c = near[sel].mean(0)
+            c -= t * ((c - p_) @ t)              # stay in this cross-section
+            if np.linalg.norm(c - p_) < max_shift:
+                out[k] = c
+    sm = out.copy()                               # light smoothing
+    sm[1:-1] = 0.25 * out[:-2] + 0.5 * out[1:-1] + 0.25 * out[2:]
+    return sm
+
+
+def _strand_joins(s, names, segments=24):
+    """PyMOL ends each beta strand in an arrow whose point is the only place
+    the next loop touches it, which prints as a weak point. Continue the loop
+    tube smoothly into the strand: one tube swept along the cartoon's own
+    center line, the loop's radius on the loop side, easing down inside the
+    strand so it doesn't bulge out of its faces. Returns (pieces, n)."""
+    pieces, n = [], 0
+    objs = [o for o in names if o not in _struts_registry and not o.startswith('preview_')]
+    meshes = {}
+    amap = _cartoon_anchor_map(objs, s, meshes)
+    for obj in objs:
+        V = meshes.get(obj)
+        if V is None:
+            continue
+        try:
+            loop_r = float(s.get('cartoon_loop_radius', obj))
+            half_t = float(s.get('cartoon_rect_width', obj)) * _STRAND_FACTOR / 2.0
+        except Exception:
+            continue
+        r_out, r_in = 0.95 * loop_r, 0.9 * min(loop_r, half_t)
+        rows = []
+        s.iterate_state(-1, '(%s) and name CA and rep cartoon' % obj,
+                        'rows.append((segi, chain, int(resv), ss, color, x, y, z))',
+                        space={'rows': rows, 'int': int})
+        rows.sort(key=lambda r: (r[0], r[1], r[2]))
+        runs, cur = [], []
+        for r in rows:
+            if cur and r[:2] == cur[-1][:2] and r[2] == cur[-1][2] + 1:
+                cur.append(r)
+            else:
+                if cur:
+                    runs.append(cur)
+                cur = [r]
+        if cur:
+            runs.append(cur)
+        for run in runs:
+            ctr = [amap.get((obj, _pkey(r[5:8])), np.array(r[5:8], float)) for r in run]
+            isS = [r[3] == 'S' for r in run]
+            for i in range(len(run) - 1):
+                if isS[i] == isS[i + 1]:
+                    continue
+                idx = list(range(max(i - 1, 0), min(i + 3, len(run))))
+                sub = 8
+                path = _catmull([ctr[j] for j in idx], sub)
+                # keep from one residue inside the strand to one residue into the loop
+                pos = np.arange(len(path)) / float(sub) + idx[0]     # residue coordinate
+                if isS[i]:
+                    keep = (pos >= i - 1) & (pos <= i + 1.0)
+                else:
+                    keep = (pos >= i) & (pos <= i + 2)
+                path, pos = path[keep], pos[keep]
+                if len(path) < 4:
+                    continue
+                path = _center_on_mesh(V, path)
+                # strand side r_in, loop side r_out, eased across the boundary
+                x = (pos - i) if isS[i] else (i + 1 - pos)     # 0..1 = strand end -> loop start
+                w = np.clip(x, 0, 1)
+                w = w * w * (3 - 2 * w)
+                radii = r_in + (r_out - r_in) * w
+                va, ta, ring = pc.sweep_tube(path, radii, segments)
+                res = np.clip(np.round(pos).astype(int), 0, len(run) - 1)
+                cols = np.array([_cartoon_rgb(s, obj, np.array(
+                    [int(round(255 * c)) for c in s.get_color_tuple(run[k][4])], np.uint8))
+                    for k in res], np.uint8)
+                pieces.append((va, ta, cols[ring]))
+                n += 1
+    return pieces, n
 
 
 def _single_bonds(s, objects=None):
@@ -1359,7 +1470,8 @@ def _write_group(parts, fmt, path_stem, ext, label, slot_of, palette_names, line
 def colorprint(filename, objects='', format='', each=-1, size_mm=-1.0, mm_per_A=-1.0,
                nozzle=-1.0, layer_height=-1.0, preview=-1, printer='', bed_x=-1.0,
                bed_y=-1.0, bed_z=-1.0, slots=-1, fit=-1, show_bed=-1, show_thin=-1,
-               helix_core=-1, support_angle=-1.0, show_overhang=-1,
+               helix_core=-1, support_angle=-1.0, show_overhang=-1, join_strands=-1,
+               use_manifold=-1,
                orient='', filaments=None, base='', base_depth=-1.0, pillars=-1,
                pillar_d=-1.0, min_feature=-1.0, attach=-1, attach_mm=-1.0,
                single_color=-1, socket_clearance=-1.0, union=-1,
@@ -1389,6 +1501,11 @@ ARGUMENTS
                 every color is snapped to the closest filament.
                 filaments=auto picks common PLA colors closest to the scene
                 (as many as the printer's filament slots, default 4)
+    use_manifold = 0: don't use the merge library (manifold3d) even if it is
+             installed: plain capped meshes, no merging, bases or connectors
+    join_strands = 1 (default): run each loop into its beta strand with a rod
+             along the cartoon's center line, so arrow tips aren't the only
+             contact (they print as a weak point)
     helix_core = 1: fill each cartoon helix with a solid rod along its axis, so
              no support builds up inside it
     support_angle = overhangs flatter than this (degrees from horizontal) need
@@ -1424,6 +1541,7 @@ ARGUMENTS
                  bed_x=bed_x, bed_y=bed_y, bed_z=bed_z, slots=slots, fit=fit,
                  show_bed=show_bed, show_thin=show_thin, helix_core=helix_core,
                  support_angle=support_angle, show_overhang=show_overhang,
+                 join_strands=join_strands, use_manifold=use_manifold,
                  orient=orient, filaments=filaments, base=base, base_depth=base_depth,
                  pillars=pillars, pillar_d=pillar_d, min_feature=min_feature, attach=attach,
                  attach_mm=attach_mm, single_color=single_color,
@@ -1484,7 +1602,7 @@ ARGUMENTS
         print(' colorprint: unknown object(s): %s' % ', '.join(missing))
         return
     _last['export'] = {k: o[k] for k in EXPORT_DEFAULTS}
-    solid_ok = pc.have_manifold()
+    solid_ok = pc.have_manifold() and _b(o['use_manifold'])
 
     # struts deleted in the viewer stay deleted; struts colored by chain
     # follow any recoloring done since they were made
@@ -1525,6 +1643,11 @@ ARGUMENTS
                                        notes, info)
             gn = gnames or [n for n in s.get_names('objects', enabled_only=1)
                             if not n.startswith('preview_')]
+            if pieces and _b(o['join_strands']):
+                joins, nj = _strand_joins(s, gn, max(16, 2 * seg))
+                pieces += joins
+                if nj:
+                    notes.append('joined %d strand ends to their loops' % nj)
             if pieces and _b(o['helix_core']):
                 cores, nh = _helix_cores(s, gn, max(8, seg))
                 pieces += cores

@@ -102,6 +102,8 @@ Printer checks: with `printer=` or `bed_x/y/z`, the report compares each group's
 
 Supports: `pc.overhang_mask` / `pc.overhang_area` use the slicer convention (faces flatter than `support_angle` degrees from horizontal, not on the bed). `orient=min_support` scores 400 up directions with `pc.support_scores` (projected overhang area) and builds the rotation with `pc.frame_with_up`, keeping the screen's x axis. `helix_core=1` adds `_helix_cores` rods (axis from CA bisectors, radius sized to fuse with the ribbon) to the pieces before placement. `filaments=auto` uses `pc.pick_filaments` with `pc.FILAMENT_LIBRARY`.
 
+`join_strands=1` (default) adds `_strand_joins` tubes: at every strand/loop boundary, one tube swept (`pc.sweep_tube`, no twist) along the cartoon's own center line (Catmull-Rom through `_cartoon_anchor_map` points, then re-centered on the cartoon mesh by `_center_on_mesh`), from one residue inside the strand into the start of the loop. Its radius is just under the loop tube's on the loop side and eases down inside the strand, so the loop looks like it runs into the strand; PyMOL's arrow tip is otherwise the only contact.
+
 Fine PyMOL surfaces (`surface_quality` 1 and up) have a few seams where 3 or 4 triangles share an edge; `pc.repair_nonmanifold` cuts those spots out with a ring of neighbours and refills the holes, so the surface stays one closed solid.
 
 Nozzle and layer height (`nozzle`, `layer_height`) drive every option left at 0 ("auto"): thinnest feature, fit and socket clearances, pillar size, base sizes rounded to whole layers and rod facets (`pc.auto_segments`). New print-related options should follow the same pattern instead of hard-coding millimetres.
@@ -120,6 +122,9 @@ Keep PyMOL calls in `print3d.py` and geometry in `print3d_core.py`, so the core 
 - Struts live in `print3d._struts_registry[name]` = `dict(struts=[dict(p1, p2, m1, m2, l1, l2)], radius, color, labels)`; `color=None` means each half takes its chain's color (`_chain_color_lookup`), recomputed whenever struts are drawn or exported. They are drawn by `_draw_struts` as a small molecule object (strut k = residue STR k of chain S, pseudo-atoms E1/E2 of element PS, one bond, flagged `ignore`), so they can be clicked, selected and labeled. Always change struts through the registry and redraw; never edit the object directly. `p1`/`p2` are always the atom positions (used to match atoms, colors and parts); optional `d1`/`d2` are where the ends are drawn, on the cartoon center line (`_cartoon_anchor_map`: centroid of the cartoon mesh in a thin slab across each CA shown as cartoon). Use `_ends(st)` for geometry. Per-object exports build temporary CGO copies with `_strut_cgo`.
 
 ## manifold3d quirks
+
+- Build every Manifold from arrays with `pc.make_manifold` (never `mf.Mesh(...)` directly): manifold3d rejects read-only arrays with a TypeError, and numpy 1.x (as bundled with PyMOL) returns read-only arrays from `to_mesh()`. The helper copies, reshapes and returns None for anything that isn't a valid solid.
+- `colorprint ..., use_manifold=0` (GUI: "Use merge library") turns the library off for a run; every manifold-dependent step must check `solid_ok`.
 
 - Optional: always check `pc.have_manifold()` and fall back gracefully.
 - Operators: `+` union, `-` difference, `^` intersection.
