@@ -64,9 +64,9 @@ HELP = {
         'the same meaning as ChimeraX). Applies to every object. Once scaled, parts thinner '
         'than about 1.5 mm break easily on an FDM printer; the export report warns about '
         'them. Smoothness is PyMOL\'s cartoon_sampling (higher is smoother, files get bigger).\n'
-        '"Show strand-loop joins" draws (object strand_joins) how the export runs each loop '
-        'into its beta strand: PyMOL\'s arrow tip alone is a weak point, so the loop continues '
-        'into the strand and the arrow ends in a blunt tip the width of the loop.'),
+        '"Show strand-loop joins" draws (object strand_joins) how the export joins each '
+        'arrowhead to its loop: PyMOL\'s arrow tip alone is a weak point, so the loop tube is '
+        'extended a short way into the arrowhead.'),
     'separate': (
         'Copies ligands or chains into their own objects, so each is surfaced on its own '
         '(the protein never cuts into a ligand surface) and can be exported as its own file.\n'
@@ -116,7 +116,7 @@ HELP = {
         'Longest side sets the printed size (or use the scale). "As on screen" prints the '
         'model the way you see it, screen-down on the bed. Filament colors: every color snaps '
         'to the closest loaded filament; "Auto-pick" fills the slots with common PLA colors closest to the scene. Single-color printer: one file per color, smaller '
-        'pieces plug into sockets. Base: flat cut, or a stand with pillars. "Join strand arrows" (on by default) runs each loop into its strand, since an arrow tip alone is a weak joint. The report lists '
+        'pieces plug into sockets. Base: none (default), flat cut, or a stand with pillars. "Join strand arrows" (on by default) extends each loop tube into its arrowhead, since an arrow tip alone is a weak joint. The report lists '
         'size, grams, thin parts, floating pieces and bed contact.'),
     'scripts': (
         'Every .py file in this folder, with the commands it adds. Pick a command, fill in '
@@ -387,6 +387,8 @@ def make_panel(parent=None):
                 c = W.QColorDialog.getColor(parent=self)
                 if c.isValid():
                     edit.setText('0x%02x%02x%02x' % (c.red(), c.green(), c.blue()))
+                    if edit in getattr(self, 'slots', []):
+                        self._describe_slot(edit)
             btn.clicked.connect(pick)
             h.addWidget(edit)
             h.addWidget(btn)
@@ -521,8 +523,8 @@ def make_panel(parent=None):
             f.addRow(hh)
             sj = R('show_joins', W.QCheckBox('Show strand-loop joins'))
             sj.setChecked(True)
-            sj.setToolTip('Shows, as the object "strand_joins", where the export runs each loop '
-                          'into its beta strand (a blunt arrow tip the width of the loop). '
+            sj.setToolTip('Shows, as the object "strand_joins", where the export extends each '
+                          'loop tube a short way into its strand\'s arrowhead. '
                           'Display only; the export builds its own.')
             f.addRow(sj)
             ch = R('cylinder_helices', W.QCheckBox('Helices as solid cylinders (no supports inside)'))
@@ -759,6 +761,8 @@ def make_panel(parent=None):
                 srow, sedit = self._color_row('')
                 sedit.setPlaceholderText('empty')
                 self.slots.append(sedit)
+                sedit.editingFinished.connect(lambda e=sedit: self._describe_slot(e))
+                sedit.textChanged.connect(lambda _t, e=sedit: self._describe_slot(e, typing=True))
                 f.addRow('Filament %d' % (i + 1), srow)
             ab = W.QPushButton('Auto-pick filaments from scene colors')
             ab.setToolTip('Fill the slots with common PLA colors closest to the colors shown '
@@ -773,10 +777,9 @@ def make_panel(parent=None):
             js_ = R('join_strands', W.QCheckBox('Join strand arrows to their loops'))
             js_.setChecked(True)
             js_.setToolTip('PyMOL ends strands in an arrow whose tip is the only contact with '
-                           'the next loop. This runs the loop into the strand along the cartoon\'s '
-                           'center line, flattening to the strand\'s thickness, so the arrow ends '
-                           'in a blunt tip the width of the loop (as in ChimeraX) and the joint '
-                           'does not break. "Show strand-loop joins" under Thickness shows it.')
+                           'the next loop. This extends the loop tube (same radius, same path) '
+                           'a short way back into the arrowhead, so the joint does not break. '
+                           '"Show strand-loop joins" under Thickness shows it.')
             f.addRow(js_)
 
             adv_toggle = W.QCheckBox('Show advanced options')
@@ -932,9 +935,35 @@ def make_panel(parent=None):
 
         def _gather(self):
             d = {sec: self._values(sec) for sec in self._fields}
-            d['export']['filaments'] = ' '.join(s.text().strip() for s in self.slots if s.text().strip())
+            d['export']['filaments'] = self._slot_colors()
             d['export'].pop('objects', None)
             return d
+
+        @staticmethod
+        def _slot_value(text):
+            import re
+            return re.sub(r'\([^)]*\)', '', str(text)).strip()
+
+        def _slot_colors(self):
+            return ' '.join(v for v in (self._slot_value(s.text()) for s in self.slots) if v)
+
+        def _describe_slot(self, edit, typing=False):
+            """Add a plain color name after a hex code: 0xc12e1f (Red)."""
+            raw = edit.text()
+            val = self._slot_value(raw)
+            if not val.lower().startswith(('0x', '#')) or len(val.lstrip('#').replace('0x', '', 1)) != 6:
+                return
+            if typing and '(' not in raw:
+                return                      # wait until editing is finished
+            try:
+                rgb = [int(val.lstrip('#').replace('0x', '', 1)[k:k + 2], 16) for k in (0, 2, 4)]
+            except ValueError:
+                return
+            want = '%s (%s)' % (val, pc.describe_color(rgb))
+            if raw != want:
+                edit.blockSignals(True)
+                edit.setText(want)
+                edit.blockSignals(False)
 
         def _preset_save(self):
             name = self.preset.currentText().strip()
@@ -966,6 +995,7 @@ def make_panel(parent=None):
                 fil = str(p['export']['filaments']).split()
                 for i, s in enumerate(self.slots):
                     s.setText(fil[i] if i < len(fil) else '')
+                    self._describe_slot(s)
             hint = []
             if 'style' in p:
                 hint.append('Apply thickness')
@@ -1063,7 +1093,7 @@ def make_panel(parent=None):
         def _export(self, preview=False):
             vals = self._values('export')
             vals['preview'] = int(bool(preview))
-            vals['filaments'] = ' '.join(s.text().strip() for s in self.slots if s.text().strip())
+            vals['filaments'] = self._slot_colors()
             r = self._run('Export', print3d.colorprint, self.efile.text(), **vals)
             self.report.setPlainText('\n'.join(print3d._last.get('report', [])))
             if r:
@@ -1101,7 +1131,8 @@ def make_panel(parent=None):
                 self._say('Nothing shown to pick colors from', error=True)
                 return
             for i, s in enumerate(self.slots):
-                s.setText('0x' + picked[i][1].lstrip('#').lower() if i < len(picked) else '')
+                s.setText('0x%s (%s)' % (picked[i][1].lstrip('#').lower(), picked[i][0].title())
+                          if i < len(picked) else '')
             self._say('Filaments: ' + ', '.join('%d=%s' % (i + 1, nm) for i, (nm, _, _) in
                                                 enumerate(picked[:len(self.slots)])))
 

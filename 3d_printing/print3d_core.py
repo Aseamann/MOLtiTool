@@ -1325,8 +1325,11 @@ def thin_mask(solid, va, ta, min_mm, max_rays=6000):
     return thin_cell[inv]
 
 
-def mesh_cgo(va, ta, tc):
-    """PyMOL CGO triangle list (flat-shaded) for a preview of a printed part."""
+def mesh_cgo(va, ta, tc, smooth=False):
+    """PyMOL CGO triangle list for a preview of a printed part (flat-shaded,
+    or smooth-shaded with averaged vertex normals)."""
+    if smooth:
+        return _mesh_cgo_smooth(va, ta, tc)
     from pymol import cgo
     va = np.asarray(va, float)
     ta = np.asarray(ta, np.int64)
@@ -1447,14 +1450,16 @@ def best_up(pieces, angle=30.0, n=400, tol=0.5, prefer=None):
 FILAMENT_LIBRARY = [
     ('white', '#FFFFFF'), ('black', '#1A1A1A'), ('light gray', '#D1D3D5'),
     ('gray', '#8E9089'), ('dark gray', '#545454'), ('silver', '#A6A9AA'),
-    ('red', '#C12E1F'), ('maroon', '#9D2235'), ('orange', '#FF6A13'),
+    ('red', '#C12E1F'), ('bright red', '#E8231F'), ('maroon', '#9D2235'), ('orange', '#FF6A13'),
     ('pumpkin orange', '#FF9016'), ('yellow', '#F4EE2A'), ('sunflower yellow', '#FEC600'),
     ('gold', '#E4BD68'), ('beige', '#F7E6DE'), ('brown', '#9D432C'),
     ('cocoa brown', '#6F5034'), ('lime green', '#BECF00'), ('green', '#00AE42'),
     ('dark green', '#3F8E43'), ('turquoise', '#00B1B7'), ('cyan', '#0086D6'),
-    ('sky blue', '#73C2FB'), ('cobalt blue', '#0056B8'), ('navy blue', '#0A2989'),
+    ('sky blue', '#73C2FB'), ('light blue', '#9CC3F5'), ('blue', '#2A5CDB'),
+    ('cobalt blue', '#0056B8'), ('navy blue', '#0A2989'),
     ('blue gray', '#5B6579'), ('purple', '#5E43B7'), ('indigo', '#482960'),
     ('magenta', '#EC008C'), ('pink', '#F55A74'), ('light pink', '#F7B6C8'),
+    ('lavender', '#B39DDB'),
 ]
 
 
@@ -1539,3 +1544,34 @@ def sweep_tube(path, radii, segments=24, radii2=None, up=None):
     if np.einsum('ij,ij->i', v0, np.cross(v1, v2)).sum() < 0:
         ta = ta[:, ::-1]
     return va, ta, ring
+
+
+def _mesh_cgo_smooth(va, ta, tc):
+    from pymol import cgo
+    va = np.asarray(va, float)
+    ta = np.asarray(ta, np.int64)
+    fn = np.cross(va[ta[:, 1]] - va[ta[:, 0]], va[ta[:, 2]] - va[ta[:, 0]])
+    vn = np.zeros_like(va)
+    for k in range(3):
+        np.add.at(vn, ta[:, k], fn)
+    vn /= np.maximum(np.linalg.norm(vn, axis=1), 1e-12)[:, None]
+    col = np.asarray(tc, float)[:, :3] / 255.0
+    m = len(ta)
+    rec = np.empty((m, 28))
+    rec[:, 0] = cgo.COLOR
+    rec[:, 1:4] = col
+    for k in range(3):
+        o = 4 + 8 * k
+        rec[:, o] = cgo.NORMAL
+        rec[:, o + 1:o + 4] = vn[ta[:, k]]
+        rec[:, o + 4] = cgo.VERTEX
+        rec[:, o + 5:o + 8] = va[ta[:, k]]
+    return [cgo.BEGIN, cgo.TRIANGLES] + rec.ravel().tolist() + [cgo.END]
+
+
+def describe_color(rgb):
+    """Plain name of the common filament color closest to rgb (uint8), e.g. 'Red'."""
+    lab_lib = _srgb_to_lab(np.array([_hex_rgb(h) for _, h in FILAMENT_LIBRARY]))
+    lab = _srgb_to_lab(np.asarray(rgb, np.uint8).reshape(1, 3))
+    k = int(((lab_lib - lab) ** 2).sum(-1).argmin())
+    return FILAMENT_LIBRARY[k][0].title()

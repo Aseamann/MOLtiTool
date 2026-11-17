@@ -169,6 +169,9 @@ USAGE
     s.set('cartoon_loop_radius', _f(loop_thickness) / _LOOP_FACTOR)
     s.set('stick_radius', _f(stick_radius))
     s.set('cartoon_sampling', int(float(sampling)))
+    # round tubes and ovals instead of PyMOL's 6- and 10-sided defaults
+    s.set('cartoon_loop_quality', max(16, int(float(sampling))))
+    s.set('cartoon_oval_quality', max(16, int(float(sampling))))
     s.set('cartoon_fancy_helices', 0)
     s.set('cartoon_cylindrical_helices', 1 if _b(cylinder_helices) else 0)
     s.set('cartoon_helix_radius', _f(helix_radius))
@@ -1028,16 +1031,16 @@ _SURFACE = dict(selection='all', quality=2, probe=1.4, solvent=0, smooth_edges=1
 BUILTIN_PRESETS = {
     'Multi-color Printer Cartoon': dict(
         style=dict(_CARTOON_STYLE), struts=dict(_STRUTS),
-        export=dict(format='3mf', single_color=0, base='stand', attach=1, union=1)),
+        export=dict(format='3mf', single_color=0, base='none', attach=1, union=1)),
     'Single Color Printer Cartoon': dict(
         style=dict(_CARTOON_STYLE), struts=dict(_STRUTS),
-        export=dict(format='stl', single_color=1, base='stand', attach=1, union=1)),
+        export=dict(format='stl', single_color=1, base='none', attach=1, union=1)),
     'Multi-color Printer Surface': dict(
         surface=dict(_SURFACE),
-        export=dict(format='3mf', single_color=0, base='cut', base_depth=1.0, attach=1, union=1)),
+        export=dict(format='3mf', single_color=0, base='none', attach=1, union=1)),
     'Single Color Printer Surface': dict(
         surface=dict(_SURFACE),
-        export=dict(format='stl', single_color=1, base='cut', base_depth=1.0, attach=1, union=1)),
+        export=dict(format='stl', single_color=1, base='none', attach=1, union=1)),
 }
 
 
@@ -1099,7 +1102,7 @@ def _helix_cores(s, names, segments=12, overlap=0.4):
         if obj in _struts_registry or _is_overlay(obj):
             continue
         try:
-            if int(s.get('cartoon_cylindrical_helices', obj)):
+            if _b(s.get('cartoon_cylindrical_helices', obj)):
                 continue                                  # already solid
             thick = float(s.get('cartoon_oval_width', obj)) * _HELIX_FACTOR
         except Exception:
@@ -1189,12 +1192,11 @@ def _center_on_mesh(V, pts, half=0.35, reach=2.6, max_shift=1.0):
 
 def _strand_joins(s, names, segments=24):
     """PyMOL ends each beta strand in an arrow whose point is the only place
-    the next loop touches it, which prints as a weak point. Continue the loop
-    into the strand the way ChimeraX does: one tube swept along the cartoon's
-    own center line, round like the loop on the loop side and flattening to
-    the strand's thickness (flush with its faces) inside the strand, so the
-    arrow ends in a blunt tip the width of the loop that flows into the loop.
-    Returns (pieces, n)."""
+    the next loop touches it, which prints as a weak point. Extend the loop
+    tube itself a short way back into the arrowhead: same radius, same path
+    (the cartoon's center line), tapering at the buried end so it blends into
+    the arrowhead's faces. Only at arrowheads (strand -> loop); the blunt
+    start of a strand already meets its loop face to face. Returns (pieces, n)."""
     pieces, n = [], 0
     objs = [o for o in names if o not in _struts_registry and not _is_overlay(o)]
     meshes = {}
@@ -1204,12 +1206,13 @@ def _strand_joins(s, names, segments=24):
         if V is None:
             continue
         try:
-            loop_r = float(s.get('cartoon_loop_radius', obj))
+            q = max(3, int(float(s.get('cartoon_loop_quality', obj))))
+            # PyMOL's tube is a q-sided prism; stay on its flat faces
+            loop_r = float(s.get('cartoon_loop_radius', obj)) * np.cos(np.pi / q) * 0.995
             half_t = float(s.get('cartoon_rect_width', obj)) * _STRAND_FACTOR / 2.0
         except Exception:
             continue
-        r_loop = 0.97 * loop_r                  # just inside the loop tube
-        r_flat = 0.96 * min(half_t, loop_r)     # just inside the strand faces
+        segments = max(segments, 2 * q)
         rows = []
         s.iterate_state(-1, '(%s) and name CA and rep cartoon' % obj,
                         'rows.append((segi, chain, int(resv), ss, color, x, y, z))',
@@ -1227,47 +1230,30 @@ def _strand_joins(s, names, segments=24):
             runs.append(cur)
         for run in runs:
             ctr = [amap.get((obj, _pkey(r[5:8])), np.array(r[5:8], float)) for r in run]
-            isS = [r[3] == 'S' for r in run]
-            for i in range(len(run) - 1):
-                if isS[i] == isS[i + 1]:
-                    continue
-                si = i if isS[i] else i + 1             # strand residue at the boundary
-                inward = -1 if isS[i] else 1            # direction into the strand
-                s2 = si + inward
-                if not (0 <= s2 < len(run)) or not isS[s2]:
-                    s2 = si
-                # strand face normal: flattest direction of the cartoon around it
-                cen = 0.5 * (ctr[si] + ctr[s2])
-                near = V[np.linalg.norm(V - cen, axis=1) < 2.4]
-                if len(near) < 6:
-                    continue
-                w_, v_ = np.linalg.eigh(np.cov((near - near.mean(0)).T))
-                up = v_[:, 0]
+            for i in range(1, len(run) - 1):
+                if not (run[i][3] == 'S' and run[i + 1][3] != 'S'):
+                    continue                     # arrowheads only
                 idx = list(range(max(i - 1, 0), min(i + 3, len(run))))
-                sub = 10
+                sub = 20
                 path = _catmull([ctr[j] for j in idx], sub)
-                pos = np.arange(len(path)) / float(sub) + idx[0]
-                # x: 0 at the strand's last residue, 1 at the first loop residue
-                x = (pos - i) if isS[i] else (i + 1 - pos)
-                keep = (x >= -1.0) & (x <= 1.3)
-                path, pos, x = path[keep], pos[keep], x[keep]
+                x = np.arange(len(path)) / float(sub) + idx[0] - i   # 0 = arrow tip
+                keep = (x >= -0.45) & (x <= 0.15)
+                path, x = path[keep], x[keep]
                 if len(path) < 4:
                     continue
                 path = _center_on_mesh(V, path)
-                # flat (strand-thick) until the arrow tip, then round like the loop
-                w = np.clip((x - 0.35) / 0.55, 0, 1)
-                w = w * w * (3 - 2 * w)
-                thick = r_flat + (r_loop - r_flat) * w
-                # bury the far end inside the loop tube (no near-coincident skin)
-                e = np.clip((x - 0.85) / 0.45, 0, 1)
-                bury = 1.0 - 0.25 * e * e * (3 - 2 * e)
-                va, ta, ring = pc.sweep_tube(path, r_loop * bury, segments,
-                                             radii2=np.minimum(thick, r_loop * bury), up=up)
-                res = np.clip(np.round(pos).astype(int), 0, len(run) - 1)
-                cols = np.array([_cartoon_rgb(s, obj, np.array(
-                    [int(round(255 * c)) for c in s.get_color_tuple(run[k][4])], np.uint8))
-                    for k in res], np.uint8)
-                pieces.append((va, ta, cols[ring]))
+                # loop radius from the tip back; blend into the arrowhead faces at
+                # the buried end, and slim the short overlap inside the loop tube
+                a = np.clip((x + 0.45) / 0.3, 0, 1)
+                a = a * a * (3 - 2 * a)
+                b = np.clip(x / 0.15, 0, 1)
+                b = b * b * (3 - 2 * b)
+                rad = (0.95 * min(half_t, loop_r) + (loop_r - 0.95 * min(half_t, loop_r)) * a) \
+                    * (1.0 - 0.15 * b)
+                va, ta, ring = pc.sweep_tube(path, rad, segments)
+                col = _cartoon_rgb(s, obj, np.array(
+                    [int(round(255 * c)) for c in s.get_color_tuple(run[i + 1][4])], np.uint8))
+                pieces.append((va, ta, np.tile(col, (len(va), 1))))
                 n += 1
     return pieces, n
 
@@ -1305,7 +1291,7 @@ USAGE
         return 0
     cg = []
     for va, ta, vc in pieces:
-        cg += pc.mesh_cgo(va, ta, np.asarray(vc)[np.asarray(ta)[:, 0]])
+        cg += pc.mesh_cgo(va, ta, np.asarray(vc)[np.asarray(ta)[:, 0]], smooth=True)
     s.load_cgo(cg, JOINS_OBJECT)
     return nj
 
@@ -1384,9 +1370,11 @@ def _vrml_of(s, names, temp_cgo=None):
 
 
 def _parse_colors(text, s):
-    """'cyan orange 0x3366ff #00ff00' -> list of (name, rgb uint8)."""
+    """'cyan orange 0x3366ff #00ff00' -> list of (name, rgb uint8). Notes in
+    parentheses are ignored, e.g. '0xc12e1f (Red)'."""
+    import re
     out = []
-    for tok in str(text).replace(',', ' ').split():
+    for tok in re.sub(r'\([^)]*\)', ' ', str(text)).replace(',', ' ').split():
         t = tok.strip()
         if not t:
             continue
@@ -1859,7 +1847,10 @@ ARGUMENTS
                   'clearance %.2f mm, socket clearance %.2f mm, %d facets per rod'
                   % (nz, lh, min_feature, fit_c, socket_c, segments))
     if pal:
-        report.append('filaments: ' + ', '.join('%d=%s' % (i + 1, n) for i, (n, _) in enumerate(pal)))
+        report.append('filaments: ' + ', '.join(
+            '%d=%s' % (i + 1, n if not n.lower().startswith(('0x', '#')) else
+                       '%s (%s)' % (n, pc.describe_color(c)))
+            for i, (n, c) in enumerate(pal)))
         report.append('   colors mapped: ' + ', '.join(
             '#%s->%d' % (pc.hex_color(c), sl + 1) for c, sl in orig_map))
     thin_cgo, thin_tris, over_cgo = [], 0, []
