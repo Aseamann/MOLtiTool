@@ -41,7 +41,7 @@ if os.path.isdir(PRINT3D_DIR):
 # files that are part of the hub itself, not user scripts
 _HIDDEN = {'script_hub.py', 'print3d_core.py'}
 
-_state = {'dock': None, 'loaded': set()}
+_state = {'dock': None, 'loaded': {}}   # loaded: path -> file mtime at load
 
 HELP = {
     'printer': (
@@ -121,7 +121,8 @@ HELP = {
     'scripts': (
         'Every .py file in this folder, with the commands it adds. Pick a command, fill in '
         'the form and press Run; the exact command line appears in the PyMOL log. Scripts '
-        'without commands get a "Run script" button. New files appear after Refresh. To '
+        'without commands get a "Run script" button. Arguments with a fixed set of options '
+        'show as drop-downs. New files appear after Refresh. To '
         'write your own, see AGENTS.md in this folder.'),
 }
 
@@ -139,7 +140,7 @@ def _doc_first_lines(doc, n=12):
 
 def scan_script(path):
     """Return dict(path, name, doc, commands=[dict(name, params, doc)]).
-    params: list of (arg, default_text or None)."""
+    params: list of (arg, default_text or None, choices or None)."""
     info = dict(path=path, name=os.path.basename(path), doc='', commands=[], error=None)
     try:
         src = open(path, encoding='utf-8', errors='replace').read()
@@ -182,10 +183,12 @@ def scan_script(path):
             for arg, d in zip(pos, defaults):
                 if arg.arg.startswith('_'):
                     continue
-                params.append((arg.arg, None if d is None else _literal_text(d)))
+                params.append((arg.arg, None if d is None else _literal_text(d),
+                               _literal_choices(arg.annotation)))
             for arg, d in zip(a.kwonlyargs, a.kw_defaults):
                 if not arg.arg.startswith('_'):
-                    params.append((arg.arg, None if d is None else _literal_text(d)))
+                    params.append((arg.arg, None if d is None else _literal_text(d),
+                                   _literal_choices(arg.annotation)))
         info['commands'].append(dict(name=cname, params=params, doc=doc))
     return info
 
@@ -201,6 +204,25 @@ def _literal_text(node):
             return ''
 
 
+def _literal_choices(node):
+    """Options of a Literal["a", "b"] (or typing.Literal) annotation, else None."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    base = node.value
+    if getattr(base, 'id', None) != 'Literal' and getattr(base, 'attr', None) != 'Literal':
+        return None
+    sl = node.slice
+    if isinstance(sl, ast.Index):  # Python < 3.9
+        sl = sl.value
+    try:
+        vals = ast.literal_eval(sl)
+    except Exception:
+        return None
+    if not isinstance(vals, tuple):
+        vals = (vals,)
+    return [str(v) for v in vals]
+
+
 def runtime_params(func):
     params = []
     try:
@@ -211,7 +233,14 @@ def runtime_params(func):
         if p.name.startswith('_') or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
             continue
         d = None if p.default is p.empty else ('' if p.default is None else str(p.default))
-        params.append((p.name, d))
+        choices = None
+        try:
+            import typing
+            if typing.get_origin(p.annotation) is typing.Literal:
+                choices = [str(v) for v in typing.get_args(p.annotation)]
+        except Exception:
+            pass
+        params.append((p.name, d, choices))
     return params
 
 
@@ -228,11 +257,23 @@ def list_scripts(folder=None):
     return out
 
 
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _is_current(path):
+    """Loaded, and the file has not changed since."""
+    return path in _state['loaded'] and _state['loaded'][path] == _mtime(path)
+
+
 def load_script(path):
     """cmd.run the file; return names of commands it newly registered."""
     before = set(cmd.keyword)
     cmd.run(path)
-    _state['loaded'].add(path)
+    _state['loaded'][path] = _mtime(path)
     return sorted(set(cmd.keyword) - before)
 
 
@@ -278,6 +319,19 @@ def make_panel(parent=None):
     import print3d_core as pc
 
     W = QtWidgets
+
+    class _ChoiceBox(W.QComboBox):
+        """Drop-down for a Literal[...] argument; .text() like a QLineEdit."""
+        def __init__(self, choices, default):
+            super().__init__()
+            if default is None:
+                self.addItem('')          # required: nothing picked yet
+            self.addItems(choices)
+            if default in choices:
+                self.setCurrentIndex(self.findText(default))
+
+        def text(self):
+            return self.currentText()
 
     class Hub(W.QWidget):
         def __init__(self):
@@ -1263,11 +1317,15 @@ def make_panel(parent=None):
             self.title.setText(c['name'] + '   (from %s)' % info['name'])
             self.doc.setPlainText(_doc_first_lines(c['doc'], 40) or
                                   _doc_first_lines(info['doc'], 20))
-            for arg, default in c['params']:
-                e = W.QLineEdit('' if default is None else default)
-                if default is None:
-                    e.setPlaceholderText('required')
-                e.textChanged.connect(self._update_preview)
+            for arg, default, choices in c['params']:
+                if choices:
+                    e = _ChoiceBox(choices, default)
+                    e.currentIndexChanged.connect(self._update_preview)
+                else:
+                    e = W.QLineEdit('' if default is None else default)
+                    if default is None:
+                        e.setPlaceholderText('required')
+                    e.textChanged.connect(self._update_preview)
                 self.form.addRow(arg, e)
                 self.inputs.append((arg, e, default))
             self.run_btn.setVisible(True)
@@ -1281,7 +1339,7 @@ def make_panel(parent=None):
                 self.cmd_preview.setText(build_command(d[2]['name'], vals))
 
         def _ensure_loaded(self, info):
-            if info['path'] in _state['loaded'] and \
+            if _is_current(info['path']) and \
                     all(c['name'] in cmd.keyword for c in info['commands']):
                 return
             new = load_script(info['path'])

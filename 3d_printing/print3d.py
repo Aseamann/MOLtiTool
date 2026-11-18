@@ -117,7 +117,13 @@ _HELIX_FACTOR = 2.0      # cartoon_oval_length/width are half sizes
 _STRAND_FACTOR = 1.414   # cartoon_rect_length/width
 _LOOP_FACTOR = 2.0       # cartoon_loop_radius is a radius
 
-_struts_registry = {}    # name -> dict(struts=[dict(p1, p2, m1, m2)], radius, color=None|rgb)
+# State lives on the pymol package, so every copy of this file shares it: the
+# Script Hub imports print3d as a module, and "run print3d.py" (e.g. from a
+# .pymolrc) loads a second copy whose commands would otherwise keep their own
+# strut list that the panel's export never sees.
+import pymol as _pymol_pkg
+_STATE = _pymol_pkg.__dict__.setdefault('_print3d_state', {})
+_struts_registry = _STATE.setdefault('struts', {})  # name -> dict(struts=[...], radius, color, labels)
 
 
 def _f(x):
@@ -407,6 +413,26 @@ def _strut_cgo(struts, radius, color, s=cmd):
     return obj
 
 
+def _strut_pieces(items, s, segments=12, round_ends=True):
+    """Mesh pieces (Angstrom) for [(strut, registry entry)]: a rod per strut,
+    split in two halves when its ends take different chain colors."""
+    lookup = _chain_color_lookup(s)
+    pieces = []
+    for st, e in items:
+        r = float(e['radius'])
+        p1, p2 = _ends(st, r)
+        if e.get('color') is not None:
+            c1 = c2 = tuple(e['color'])
+        else:
+            c1, c2 = lookup(st['m1'], st['p1']), lookup(st['m2'], st['p2'])
+        segs = [(p1, p2, c1)] if c1 == c2 else [(p1, (p1 + p2) / 2, c1), ((p1 + p2) / 2, p2, c2)]
+        for a, b, c in segs:
+            va, ta = pc.capsule_mesh(a, b, r, segments, max(3, segments // 4), round_ends)
+            col = np.array([int(round(255 * x)) for x in c[:3]], np.uint8)
+            pieces.append((va, ta, np.tile(col, (len(va), 1))))
+    return pieces
+
+
 def _strut_label(k, st):
     return 'S%d %s-%s' % (k, st.get('l1', '?'), st.get('l2', '?'))
 
@@ -467,22 +493,77 @@ def _draw_struts(name, s):
         s.disable(name)
 
 
+def _adopt_struts(s):
+    """A struts object with no strut list (e.g. opened from a saved session)
+    gets one rebuilt from its atoms, so it exports and can be edited."""
+    adopted = 0
+    others = None
+    for obj in s.get_names('objects'):
+        if obj in _struts_registry or _is_overlay(obj):
+            continue
+        n = s.count_atoms(obj)
+        if not n or n % 2 or s.count_atoms('%s and resn STR and chain S and name E1+E2' % obj) != n:
+            continue
+        ends = {}
+        s.iterate_state(-1, obj, 'E[(int(resv), name)] = (x, y, z)', space={'E': ends, 'int': int})
+        if others is None:
+            others = [(o, np.asarray(s.get_coords(o), float)) for o in s.get_names('objects')
+                      if o != obj and not _is_overlay(o) and s.count_atoms(o)]
+
+        def owner(p):
+            best = (None, 1e9)
+            for o, xyz in others:
+                if xyz is None or not len(xyz):
+                    continue
+                d = float(np.min(((xyz - p) ** 2).sum(1)))
+                if d < best[1]:
+                    best = (o, d)
+            return best[0] or obj
+        sts = []
+        for k in sorted({k for k, _ in ends}):
+            if (k, 'E1') in ends and (k, 'E2') in ends:
+                p1, p2 = np.array(ends[(k, 'E1')]), np.array(ends[(k, 'E2')])
+                sts.append(dict(p1=p1, p2=p2, m1=owner(p1), m2=owner(p2), l1='?', l2='?'))
+        if sts:
+            _struts_registry[obj] = dict(struts=sts, radius=float(s.get('stick_radius', obj)),
+                                         color=None, labels=False)
+            adopted += len(sts)
+    if adopted:
+        _msg(['picked up %d existing struts (from a saved session or another copy)' % adopted])
+    return adopted
+
+
 def _sync_struts(s, names=None):
     """Struts whose atoms were removed in the viewer (e.g. clicked and the
-    Delete key pressed) are dropped from the registry, so they stay gone."""
+    Delete key pressed) are dropped from the registry, so they stay gone.
+    Only acts when the struts object really has fewer atoms than were drawn,
+    and never empties a whole set on a failed read."""
+    _adopt_struts(s)
     dropped = 0
     for name in (list(_struts_registry) if names is None else names):
         entry = _struts_registry.get(name)
-        if not entry or name not in s.get_names('objects'):
+        if not entry or not entry['struts'] or name not in s.get_names('objects'):
             continue
-        have = set()
-        s.iterate(name, 'H.add((int(resv), name))', space={'H': have, 'int': int})
         n = len(entry['struts'])
-        if len(have) == 2 * n:
+        try:
+            cnt = s.count_atoms('%s' % name)
+        except Exception:
             continue
-        keep = [st for k, st in enumerate(entry['struts'], start=1)
-                if (k, 'E1') in have and (k, 'E2') in have]
+        if cnt >= 2 * n:
+            continue                              # nothing was removed
+        if cnt == 0:
+            keep = []                             # every strut atom was deleted
+        else:
+            try:
+                have = {(int(a.resi_number or a.resi), a.name) for a in s.get_model(name).atom}
+            except Exception:
+                continue
+            keep = [st for k, st in enumerate(entry['struts'], start=1)
+                    if (k, 'E1') in have or (k, 'E2') in have]  # gone only if both ends are
+            if not keep:
+                continue                          # unreadable: keep the struts, don't guess
         dropped += n - len(keep)
+        _msg(['%s: %d of %d strut atoms left in the viewer' % (name, cnt, 2 * n)])
         entry['struts'] = keep
         _draw_struts(name, s)
     if dropped:
@@ -1068,8 +1149,8 @@ def _printer_overlay_cgo(bed, pl, zshift, s=cmd):
 # export
 # ---------------------------------------------------------------------------
 
-_connectors = []          # list of dict(host, guest, kind, ...)
-_last = {}                # last-used options per section (for presets)
+_connectors = _STATE.setdefault('connectors', [])   # list of dict(host, guest, kind, ...)
+_last = _STATE.setdefault('last', {})               # last-used options per section
 
 EXPORT_DEFAULTS = dict(objects='', format='3mf', each=0, size_mm=0.0, mm_per_A=1.0,
                        nozzle=0.4, layer_height=0.2, preview=0, printer='', bed_x=0.0,
@@ -1659,37 +1740,55 @@ ARGUMENTS
             _draw_struts(sname, s)
 
     # ---- what to export: one group, or one per object (struts follow) ----
-    groups = []                     # (label, names, temp_cgo)
+    # Struts are built here from the strut list, not read back from PyMOL, so
+    # they are exported the same way on every PyMOL version.
+    names = [n for n in names if not _is_overlay(n)]      # never export overlays
+    live_struts = [n for n in _struts_registry
+                   if n in s.get_names('objects') and _struts_registry[n]['struts']]
+    shown = s.get_names('objects', enabled_only=1)
+    groups = []                     # (label, model objects, [(strut, entry)])
     if each:
-        targets = [n for n in (names or s.get_names('objects', enabled_only=1))
-                   if not _is_overlay(n)]
-        strut_objs = [n for n in targets if n in _struts_registry] if names else \
-            [n for n in _struts_registry if n in targets]
+        targets = [n for n in (names or shown) if not _is_overlay(n)]
         for obj in [n for n in targets if n not in _struts_registry]:
-            cgo_list = []
-            nsub = 0
-            for sname in strut_objs:
-                e = _struts_registry[sname]
-                sub = [st for st in e['struts'] if st['m1'] == obj and st['m2'] == obj]
-                nsub += len(sub)
-                cgo_list += _strut_cgo(sub, e['radius'], e['color'], s)
-            temp = ('_p3d_struts_tmp', cgo_list) if cgo_list else None
-            groups.append((obj, [obj], temp))
+            sub = [(st, _struts_registry[sn]) for sn in live_struts
+                   for st in _struts_registry[sn]['struts']
+                   if st['m1'] == obj and st['m2'] == obj]      # struts follow their object
+            groups.append((obj, [obj], sub))
     else:
-        label = names[0] if len(names) == 1 else os.path.basename(stem)
-        groups.append((label, names, None))
+        if names:                   # struts bracing a listed object come along
+            inc = [sn for sn in live_struts if sn in names or any(
+                st['m1'] in names or st['m2'] in names for st in _struts_registry[sn]['struts'])]
+            label = names[0] if len(names) == 1 else os.path.basename(stem)
+            models = [n for n in names if n not in _struts_registry]
+        else:
+            inc = [sn for sn in live_struts if sn in shown]
+            label = os.path.basename(stem)
+            models = [n for n in shown if not _is_overlay(n) and n not in _struts_registry]
+        groups.append((label, models, [(st, _struts_registry[sn]) for sn in inc
+                                       for st in _struts_registry[sn]['struts']]))
+    strut_count = {label: len(sl) for label, _, sl in groups}
+    n_all = sum(len(_struts_registry[n]['struts']) for n in live_struts)
+    n_out = sum(strut_count.values())
 
     notes_all = []
-    vrmls = [(label, gnames, _vrml_of(s, gnames, temp)) for label, gnames, temp in groups]
+    if n_all and n_out < n_all:
+        hidden = [n for n in live_struts if n not in shown]
+        notes_all.append('%d of %d struts not exported%s' % (
+            n_all - n_out, n_all,
+            ' (struts object %s is hidden; show it to include them)' % ', '.join(hidden)
+            if hidden and not names else
+            ' (struts joining two separately exported objects are left out)' if each else ''))
+    vrmls = [(label, gnames, _vrml_of(s, gnames) if gnames else '', sl)
+             for label, gnames, sl in groups]
 
     def tessellate(seg):
         out = []
-        for label, gnames, vr in vrmls:
+        for label, gnames, vr, sl in vrmls:
             notes, info = [], {}
             pieces = pc.vrml_to_pieces(vr, seg, _b(o['round_ends']), _b(o['close_ends']),
-                                       notes, info)
-            gn = gnames or [n for n in s.get_names('objects', enabled_only=1)
-                            if not _is_overlay(n)]
+                                       notes, info) if vr else []
+            radii = list(info.get('radii', []))
+            gn = list(gnames)
             if pieces and _b(o['join_strands']):
                 joins, nj = _strand_joins(s, gn, max(16, 2 * seg))
                 pieces += joins
@@ -1700,9 +1799,15 @@ ARGUMENTS
                 pieces += cores
                 if nh:
                     notes.append('filled %d helices with a solid core' % nh)
+            if sl:
+                sp = _strut_pieces(sl, s, seg, _b(o['round_ends']))
+                pieces += sp
+                radii += [('cylinder', float(e['radius'])) for _, e in sl]
             if pieces:
-                out.append(dict(label=label, names=gn,
-                                pieces=pieces, radii=info.get('radii', []),
+                out.append(dict(label=label, names=gn + sorted({sn for sn in live_struts
+                                                                if any(e is _struts_registry[sn]
+                                                                       for _, e in sl)}),
+                                pieces=pieces, radii=radii,
                                 prims=info.get('prims', []), notes=notes))
         return out
     raw = tessellate(segments or 12)
@@ -1865,6 +1970,8 @@ ARGUMENTS
         if a.get('grams'):
             head += ', about %.0f g if printed solid' % a['grams']
         report.append(head)
+        if strut_count.get(g['label']):
+            report.append('   %d struts included' % strut_count[g['label']])
         if bed and a.get('size') is not None:
             sz = np.asarray(a['size'], float)
             over = [('XYZ'[i], sz[i], bed[i]) for i in range(3) if sz[i] > bed[i] + 1e-6]
@@ -2029,8 +2136,7 @@ USAGE
         if n not in s.get_names('objects'):
             print(' snapfit: unknown object %s' % n)
             return
-    global _connectors
-    _connectors = [c for c in _connectors if not (c['host'] == host and c['guest'] == guest)]
+    _connectors[:] = [c for c in _connectors if not (c['host'] == host and c['guest'] == guest)]
     con = dict(host=host, guest=guest, kind=str(kind).lower(), diameter=_f(diameter),
                length=_f(length), clearance=_f(clearance), magnet_d=_f(magnet_d),
                magnet_h=_f(magnet_h), wall=_f(wall))

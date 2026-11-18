@@ -45,7 +45,7 @@ A pocket multitool for PyMOL: a tidy home for your scripts, with a GUI that find
 | `apbs.py` | `apbs_all` | Electrostatics (pdb2pqr + APBS) for loaded objects |
 | `avg_plddt_pymol.py` | `avg_plddt` | Average pLDDT (B-factor) of a selection |
 | `pym_netcharge.py` | `net_charge` | Net charge of a selection |
-| `pca_noise_gradient.py` | `pca_noise_gradient` | PCA noise-gradient visualization |
+| `pca_noise_gradient.py` | `pca_noise_gradient` | Noise a copy of a structure with noise growing along a PCA, screen or residue-to-residue axis (flip, tilt, backbone/CA-only) |
 
 **ChimeraX** (`chimerax/colorprint.py`): a `colorprint` command for ChimeraX that exports the displayed scene with colors (vertex-colored OBJ or one STL per color), caps open bond cylinders and merges each color into one solid.
 
